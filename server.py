@@ -445,7 +445,7 @@ def team_view(t):
     d = {k: t[k] for k in ("id", "name", "code", "members", "cash", "holdings", "cost", "orders", "reports",
                            "defaults", "forced", "hist")}
     d["acct_classes"] = t["acct_classes"]
-    d["accounting"] = {w: {k: v for k, v in r.items() if k not in ("journals", "statements", "positions", "loans")}
+    d["accounting"] = {w: {k: v for k, v in r.items() if k not in ("journals", "statements", "closing")}
                        for w, r in t["accounting"].items()}
     d["acct"] = acct(t, max(S["week"] - 1, 0) if not S["finished"] else S["config"]["total_weeks"])
     d["loans"] = [l for l in S["loans"] if t["id"] in (l["lender"], l["borrower"])]
@@ -523,9 +523,8 @@ def api_order(sess, b):
     if S["finished"]:
         raise ApiError("游戏已结束")
     c = S["config"]
-    if c["accounting_enabled"] and c["accounting_lock_trade"] and S["week"] > 1:
-        if t["accounting"].get(str(S["week"] - 1), {}).get("status") not in ("submitted",)                 and t["accounting"].get(str(S["week"] - 1), {}).get("grade") is None:
-            raise ApiError("请先提交上一周的会计结账")
+    if c["accounting_enabled"] and c["accounting_lock_trade"] and S["week"] - 1 >= first_acct_week(t)             and not t["accounting"].get(str(S["week"] - 1), {}).get("closing"):
+        raise ApiError("请先提交上一周的会计结账")
     am = amap()
     aid, side = b.get("asset"), b.get("side")
     if aid not in am or not am[aid]["enabled"]:
@@ -754,6 +753,361 @@ def a_event(sess, b):
     return {}
 
 
+# ----------------------------------------------------------------- 会计结账
+CLASS_ACC = dict(FVTPL="交易性金融资产", FVOCI="FVOCI金融资产", AC="摊余成本金融资产", INVENTORY="存货-黄金")
+ALLOW_ACC = dict(AC="金融资产减值准备", INVENTORY="存货跌价准备")
+PL_ACCS = ("利息收入", "投资收益", "公允价值变动损益", "交易费用", "利息费用", "信用减值损失",
+           "资产减值损失", "强制清算损失", "债务核销利得")
+CLASS_NAMES = dict(FVTPL="FVTPL 交易性(公允价值变动计入损益)", FVOCI="FVOCI 可供出售/持有待售(变动计入其他综合收益)",
+                   AC="AC 摊余成本/持有至到期", INVENTORY="INVENTORY 存货(成本与可变现净值孰低)")
+
+
+def allowed_accounting_classes(a):
+    return {"stock": ["FVTPL", "FVOCI"], "gold": ["FVTPL", "INVENTORY"], "bond": ["FVTPL", "FVOCI", "AC"]}.get(a["type"], ["FVTPL"])
+
+
+def _amt(v, label):
+    try:
+        x = float(v or 0)
+    except (TypeError, ValueError):
+        raise ApiError(f"{label}必须是数字")
+    if x < 0 or x != x:
+        raise ApiError(f"{label}不能为负")
+    return x
+
+
+def first_acct_week(t):
+    return t["hist"][0]["week"] + 1
+
+
+def generate_accounting(t, week, decisions):
+    """逐周重放: 以上周结账快照为期初, 用本周成交/贷款/强平记录 + 学生判断生成分录与报表."""
+    w = int(week)
+    am = amap()
+    if w < first_acct_week(t) or not any(h["week"] == w for h in t["hist"]):
+        raise ApiError("该周尚未结算, 不能做会计结账")
+    dd = decisions if isinstance(decisions, dict) else {}
+    dcls, dimp, decl = (dd.get(k) if isinstance(dd.get(k), dict) else {} for k in ("classes", "impair", "ecl"))
+    if w > first_acct_week(t):
+        prev = t["accounting"].get(str(w - 1), {})
+        if not prev.get("closing"):
+            raise ApiError(f"请先完成并提交第 {w - 1} 周会计结账")
+        cl = prev["closing"]
+        led, pos, lallow = dict(cl["ledger"]), copy.deepcopy(cl["positions"]), dict(cl["loan_allow"])
+    else:
+        init = t["hist"][0]["nav"]
+        led, pos, lallow = {"现金": init, "实收资本": -init}, {}, {}
+    oci_open = -led.get("其他综合收益", 0.0)
+    open_qty = {k: p["qty"] for k, p in pos.items()}
+    pl, oci, journals, warnings = {}, {}, [], []
+    fa = t["facts"].get(str(w), {})
+    P = lambda aid: price_at(S, aid, w)
+    nm = lambda aid: am.get(aid, {}).get("name", aid)
+
+    def je(summary, lines, asset=None):
+        ls = [(l[0], round(l[1], 2), l[2] if len(l) > 2 else None) for l in lines if abs(l[1]) >= 0.005]
+        if not ls:
+            return
+        ls.sort(key=lambda x: x[1] < 0)
+        for a, x, tag in ls:
+            if a in PL_ACCS:
+                pl[a] = pl.get(a, 0.0) + x
+            else:
+                led[a] = led.get(a, 0.0) + x
+            if a == "其他综合收益":
+                oci[tag or "其他"] = oci.get(tag or "其他", 0.0) - x
+        journals.append(dict(week=w, summary=summary, asset=asset,
+                             lines=[dict(drcr="Dr" if x > 0 else "Cr", account=a, amount=abs(x)) for a, x, _ in ls]))
+
+    def plugged(lines, acct):
+        return lines + [(acct, -sum(round(l[1], 2) for l in lines))]
+
+    # 1 现金利息
+    if "interest" in fa:
+        je("现金利息收入", [("现金", fa["interest"]), ("利息收入", -fa["interest"])])
+    else:
+        warnings.append("缺少本周现金利息记录(旧数据), 现金核对可能不符")
+
+    # 2 AC 债券摊销(价格按票息累计 -> 利息收入)
+    for aid, p in pos.items():
+        if p["qty"] > 0 and p["cls"] == "AC" and am.get(aid, {}).get("type") == "bond":
+            d = p["qty"] * (P(aid) - price_at(S, aid, w - 1))
+            p["cost"] += d
+            je(f"{nm(aid)} 摊余成本摊销确认利息", [(CLASS_ACC["AC"], d), ("利息收入", -d)], aid)
+
+    # 3 贷款发放 / 借入
+    loans = [l for l in S["loans"] if l["status"] in ("active", "repaid", "defaulted") and t["id"] in (l["lender"], l["borrower"])]
+
+    def cpn(l):
+        oid = l["borrower"] if l["lender"] == t["id"] else l["lender"]
+        return S["teams"][oid]["name"] if oid in S["teams"] else "(已删除)"
+
+    for l in loans:
+        if l["start"] == w:
+            if l["lender"] == t["id"]:
+                je(f"向{cpn(l)}发放贷款 {l['id']}", [("贷款及应收款项", l["principal"]), ("现金", -l["principal"])])
+            else:
+                je(f"从{cpn(l)}借入款项 {l['id']}", [("现金", l["principal"]), ("短期借款", -l["principal"])])
+
+    def do_sell(aid, q, price, fee, pen, forced, label):
+        p = pos.get(aid)
+        if not p or p["qty"] <= 0:
+            warnings.append(f"{nm(aid)}: 卖出记录找不到对应持仓, 已忽略")
+            return
+        q = min(q, p["qty"])
+        r = q / p["qty"]
+        cp, fp, ap, rp = (p[k] * r for k in ("cost", "fv", "allow", "rec"))
+        acc, cls = CLASS_ACC[p["cls"]], p["cls"]
+        L = [("现金", q * price - fee - pen)]
+        if forced or cls == "FVTPL":
+            L.append(("交易费用", fee))
+        if forced:
+            L.append(("强制清算损失", pen))
+        if cls == "FVTPL":
+            L.append((acc, -(cp + fp)))
+        elif cls == "FVOCI":
+            L += [(acc, -(cp + fp)), ("其他综合收益", fp + rp, "处置转出")]
+        else:
+            L += [(acc, -cp), (ALLOW_ACC[cls], ap)]
+        je(f"{label} {nm(aid)} {q:,.0f} 股 @ {price:,.2f} ({cls})", plugged(L, "投资收益"), aid)
+        p["qty"] -= q
+        for k, v in (("cost", cp), ("fv", fp), ("allow", ap), ("rec", rp)):
+            p[k] -= v
+        if p["qty"] <= 1e-9:
+            p.update(qty=0, cost=0, fv=0, allow=0, rec=0)
+
+    # 4 本周卖出
+    for o in t["orders"]:
+        if o["week"] == w and o["status"] == "filled" and o["side"] == "sell":
+            do_sell(o["asset"], o["qty"], o["price"], o["fee"], 0, False, "卖出")
+
+    # 5 贷款利息计提(权责发生制)
+    for l in loans:
+        if l["start"] < w <= l["due"]:
+            i = l["principal"] * l["rate"] / 52
+            if l["lender"] == t["id"]:
+                je(f"计提对{cpn(l)}贷款利息 {l['id']}", [("应收利息", i), ("利息收入", -i)])
+            else:
+                je(f"计提应付{cpn(l)}利息 {l['id']}", [("利息费用", i), ("应付利息", -i)])
+
+    # 6 强制清算
+    for x in fa.get("liq", []):
+        do_sell(x["asset"], x["qty"], x["price"], x["fee"], x["penalty"], True, "强制清算卖出")
+
+    # 7 贷款到期还款 / 违约
+    for l in loans:
+        if l["due"] == w and l["status"] in ("repaid", "defaulted"):
+            P0, i, paid = l["principal"], l["principal"] * l["rate"] * l["weeks"] / 52, l.get("paid", 0.0)
+            if l["lender"] == t["id"]:
+                al = lallow.pop(l["id"], 0.0)
+                L = [("现金", paid), ("贷款损失准备", al), ("贷款及应收款项", -P0), ("应收利息", -i)]
+                je(f"{cpn(l)}{'还款' if l['status'] == 'repaid' else '违约, 收回部分款项并核销坏账'} {l['id']}", plugged(L, "信用减值损失"))
+            else:
+                L = [("短期借款", P0), ("应付利息", i), ("现金", -paid)]
+                je(f"向{cpn(l)}{'偿还借款' if l['status'] == 'repaid' else '违约, 债务按系统规则核销'} {l['id']}", plugged(L, "债务核销利得"))
+
+    # 8 本周买入
+    for o in t["orders"]:
+        if not (o["week"] == w and o["status"] == "filled" and o["side"] == "buy"):
+            continue
+        aid = o["asset"]
+        p = pos.get(aid)
+        if not p or p["qty"] <= 0:
+            d = dcls.get(aid) if isinstance(dcls.get(aid), dict) else {}
+            cls = d.get("cls")
+            if cls not in CLASS_ACC:
+                cls = (t["acct_classes"].get(aid) or {}).get("class", "FVTPL")
+                warnings.append(f"{nm(aid)}: 未选择会计分类, 暂按 {cls} 处理")
+            p = pos[aid] = dict(qty=0, cls=cls, cost=0.0, fv=0.0, allow=0.0, rec=0.0)
+            if not str(d.get("reason", "")).strip():
+                warnings.append(f"{nm(aid)}: 未填写分类理由")
+            a = am.get(aid)
+            if a and cls not in allowed_accounting_classes(a):
+                hint = "股票没有固定本金和利息现金流, 通常不能按摊余成本计量" if a["type"] == "stock" and cls == "AC" else ""
+                warnings.append(f"{nm(aid)}: {a['type']} 通常不适用 {cls}(建议 {'/'.join(allowed_accounting_classes(a))}) {hint}".strip())
+        cls, gross = p["cls"], o["qty"] * o["price"]
+        if cls == "FVTPL":
+            L = [(CLASS_ACC[cls], gross), ("交易费用", o["fee"]), ("现金", -(gross + o["fee"]))]
+            p["cost"] += gross
+        else:
+            L = [(CLASS_ACC[cls], gross + o["fee"]), ("现金", -(gross + o["fee"]))]
+            p["cost"] += gross + o["fee"]
+        p["qty"] += o["qty"]
+        je(f"买入 {nm(aid)} {o['qty']:,.0f} 股 @ {o['price']:,.2f} ({cls})", L, aid)
+
+    # 9 期末公允价值变动
+    for aid, p in pos.items():
+        if p["qty"] <= 0:
+            continue
+        if p["cls"] in ("FVTPL", "FVOCI"):
+            target = p["qty"] * P(aid) - p["cost"]
+            d = target - p["fv"]
+            if p["cls"] == "FVTPL":
+                je(f"{nm(aid)} 公允价值变动", [(CLASS_ACC["FVTPL"], d), ("公允价值变动损益", -d)], aid)
+            else:
+                je(f"{nm(aid)} 公允价值变动(计入其他综合收益)", [(CLASS_ACC["FVOCI"], d), ("其他综合收益", -d, "公允价值变动")], aid)
+            p["fv"] = target
+        elif p["cls"] == "AC" and am.get(aid, {}).get("type") != "bond":
+            warnings.append(f"{nm(aid)}: 按摊余成本计量, 不确认市价变动(与系统净资产会有差异)")
+
+    # 10 学生的减值判断 (先收集表单上下文, 再处理)
+    ctx_assets = []
+    for aid, p in pos.items():
+        a = am.get(aid, {})
+        bought = sum(o["qty"] for o in t["orders"] if o["week"] == w and o["status"] == "filled" and o["side"] == "buy" and o["asset"] == aid)
+        sold = sum(o["qty"] for o in t["orders"] if o["week"] == w and o["status"] == "filled" and o["side"] == "sell" and o["asset"] == aid) \
+            + sum(x["qty"] for x in fa.get("liq", []) if x["asset"] == aid)
+        if p["qty"] <= 0 and not bought and not sold:
+            continue
+        mv = p["qty"] * P(aid)
+        ctx_assets.append(dict(id=aid, name=a.get("name", aid), type=a.get("type"), qty_open=open_qty.get(aid, 0), bought=bought, sold=sold,
+                               qty=p["qty"], cls=p["cls"], locked=open_qty.get(aid, 0) > 0, allowed=allowed_accounting_classes(a) if a else [],
+                               price=P(aid), cost=p["cost"] - p["allow"], carrying=p["cost"] + p["fv"] - p["allow"] - p["rec"], mv=mv,
+                               unrealized=mv - (p["cost"] - p["allow"]), allow=p["allow"]))
+    for aid, d in dimp.items():
+        d = d if isinstance(d, dict) else {}
+        amt = _amt(d.get("amount"), f"{nm(aid)} 减值金额")
+        if amt < 0.005:
+            continue
+        p = pos.get(aid)
+        if not p or p["qty"] <= 0:
+            warnings.append(f"{nm(aid)}: 期末无持仓, 减值已忽略")
+            continue
+        if not str(d.get("reason", "")).strip():
+            warnings.append(f"{nm(aid)}: 未填写减值理由")
+        mv = p["qty"] * P(aid)
+        loss = max(0.0, (p["cost"] - p["allow"]) - mv)
+        if amt > loss + 0.5:
+            warnings.append(f"{nm(aid)}: 计提 {amt:,.0f} 超过未实现损失 {loss:,.0f}, 请确认依据")
+        cls = p["cls"]
+        if cls == "FVTPL":
+            warnings.append(f"{nm(aid)}: FVTPL 的价格下跌已通过公允价值变动计入损益, 不再单独计提减值, 已忽略")
+        elif cls == "FVOCI":
+            je(f"{nm(aid)} 减值: 累计其他综合收益损失转入损益", [("资产减值损失", amt), ("其他综合收益", -amt, "减值转出")], aid)
+            p["rec"] += amt
+        elif cls == "AC":
+            je(f"{nm(aid)} 计提减值准备", [("信用减值损失", amt), (ALLOW_ACC["AC"], -amt)], aid)
+            p["allow"] += amt
+        else:
+            je(f"{nm(aid)} 计提存货跌价准备", [("资产减值损失", amt), (ALLOW_ACC["INVENTORY"], -amt)], aid)
+            p["allow"] += amt
+
+    # 11 贷款信用损失
+    ctx_loans = []
+    for l in loans:
+        if l["lender"] == t["id"] and l["start"] <= w < l["due"]:
+            ctx_loans.append(dict(id=l["id"], cp=cpn(l), principal=l["principal"], rate=l["rate"], start=l["start"], due=l["due"],
+                                  accrued=l["principal"] * l["rate"] * (w - l["start"]) / 52, allow=lallow.get(l["id"], 0.0)))
+    open_ids = {x["id"] for x in ctx_loans}
+    for lid, d in decl.items():
+        d = d if isinstance(d, dict) else {}
+        amt = _amt(d.get("amount"), f"贷款 {lid} 信用损失")
+        if amt < 0.005:
+            continue
+        if lid not in open_ids:
+            warnings.append(f"贷款 {lid}: 不是本周末未到期的放款, 信用损失已忽略")
+            continue
+        l = next(x for x in loans if x["id"] == lid)
+        if lallow.get(lid, 0) + amt > l["principal"] + 0.5:
+            warnings.append(f"贷款 {lid}: 累计信用损失超过本金")
+        if not str(d.get("reason", "")).strip():
+            warnings.append(f"贷款 {lid}: 未填写信用损失判断依据")
+        je(f"贷款 {lid} 计提预期信用损失", [("信用减值损失", amt), ("贷款损失准备", -amt)])
+        lallow[lid] = lallow.get(lid, 0.0) + amt
+
+    # 12 结转损益 + 校验
+    profit = -sum(pl.values())
+    led["留存收益"] = led.get("留存收益", 0.0) - profit
+    if abs(sum(led.values())) > 0.05:
+        warnings.append(f"试算不平衡 {sum(led.values()):,.2f} (系统异常, 请告知老师)")
+    hw = next(h for h in t["hist"] if h["week"] == w)
+    if abs(led.get("现金", 0.0) - hw["cash"]) > 1:
+        warnings.append(f"会计现金 {led.get('现金', 0):,.0f} 与系统现金 {hw['cash']:,.0f} 不一致")
+
+    g = lambda k: led.get(k, 0.0)
+    nz = lambda items: [[n, round(v, 2)] for n, v in items if abs(v) >= 0.005]
+    assets = nz([("现金", g("现金")), ("交易性金融资产", g("交易性金融资产")), ("FVOCI金融资产", g("FVOCI金融资产")),
+                 ("摊余成本金融资产", g("摊余成本金融资产")), ("存货-黄金", g("存货-黄金")),
+                 ("减: 金融资产减值准备", g("金融资产减值准备")), ("减: 存货跌价准备", g("存货跌价准备")),
+                 ("贷款及应收款项", g("贷款及应收款项")), ("应收利息", g("应收利息")), ("减: 贷款损失准备", g("贷款损失准备"))])
+    liabs = nz([("短期借款", -g("短期借款")), ("应付利息", -g("应付利息"))])
+    eq = nz([("实收资本", -g("实收资本")), ("留存收益", -g("留存收益")), ("其他综合收益", -g("其他综合收益") + 0.0)])
+    ta, tl, te = (sum(x[1] for x in z) for z in (assets, liabs, eq))
+    inc = nz([(a, -pl.get(a, 0.0)) for a in PL_ACCS])
+    oci_items = nz(list(oci.items()))
+    statements = dict(
+        balance_sheet=dict(assets=assets, liabilities=liabs, equity=eq, total_assets=round(ta, 2),
+                           total_liabilities=round(tl, 2), total_equity=round(te, 2)),
+        income_statement=dict(items=inc, net_profit=round(profit, 2)),
+        oci_statement=dict(items=oci_items, total=round(sum(x[1] for x in oci_items), 2), opening=round(oci_open, 2),
+                           closing=round(-g("其他综合收益"), 2) + 0.0),
+        recon=dict(system_nav=hw["nav"], book_equity=round(te, 2), diff=round(hw["nav"] - te, 2)))
+    closing = dict(ledger={k: round(v, 4) for k, v in led.items()}, positions=pos, loan_allow=lallow)
+    return dict(journals=journals, statements=statements, warnings=warnings,
+                ctx=dict(week=w, assets=ctx_assets, loans=ctx_loans, classes=CLASS_NAMES), closing=closing)
+
+
+def api_acct_preview(sess, b):
+    t = need_team(sess)
+    r = generate_accounting(t, b.get("week"), b.get("decisions"))
+    r.pop("closing")
+    return r
+
+
+def api_acct_submit(sess, b):
+    t = need_team(sess)
+    if not S["config"]["accounting_enabled"]:
+        raise ApiError("会计结账功能未开启")
+    w = int(b.get("week"))
+    old = t["accounting"].get(str(w), {})
+    if old.get("closing") and old.get("grade") is not None:
+        raise ApiError("该周已评分, 不能修改 (请联系老师退回)")
+    if t["accounting"].get(str(w + 1), {}).get("closing"):
+        raise ApiError("下一周已提交, 不能修改本周 (请联系老师退回)")
+    dec = b.get("decisions") if isinstance(b.get("decisions"), dict) else {}
+    r = generate_accounting(t, w, dec)
+    cl = dec.get("classes") if isinstance(dec.get("classes"), dict) else {}
+    for aid, p in r["closing"]["positions"].items():
+        if p["qty"] > 0:
+            prev = t["acct_classes"].get(aid, {})
+            d = cl.get(aid) if isinstance(cl.get(aid), dict) else {}
+            same = prev.get("class") == p["cls"]
+            t["acct_classes"][aid] = {"class": p["cls"], "reason": str(d.get("reason") or (prev.get("reason", "") if same else ""))[:300],
+                                      "set_week": prev.get("set_week", w) if same else w}
+    t["accounting"][str(w)] = dict(status="submitted", decisions=dec, notes=str(b.get("notes", ""))[:3000], journals=r["journals"],
+                                   statements=r["statements"], warnings=r["warnings"], closing=r["closing"],
+                                   submitted_by=sess["name"], grade=None, comment="")
+    return {}
+
+
+def api_acct_get(sess, b):
+    t = S["teams"][b["team"]] if sess["role"] == "admin" else need_team(sess)
+    rec = t["accounting"].get(str(int(b["week"])))
+    return {k: v for k, v in rec.items() if k != "closing"} if rec else {}
+
+
+def a_acct_grade(sess, b):
+    if sess["role"] != "admin":
+        raise ApiError("需要管理员权限")
+    t = S["teams"][b["team"]]
+    w = int(b["week"])
+    rec = t["accounting"].get(str(w))
+    if not rec:
+        raise ApiError("该组该周没有会计结账记录")
+    if b.get("action") == "return":
+        if t["accounting"].get(str(w + 1), {}).get("closing"):
+            raise ApiError("该组下一周已提交, 请先退回下一周")
+        rec.update(status="returned", grade=None, comment=str(b.get("comment", ""))[:500])
+        rec.pop("closing", None)
+        return {}
+    if not rec.get("closing"):
+        raise ApiError("该周作业已被退回, 尚未重新提交")
+    g = b.get("grade")
+    rec["grade"] = None if g in (None, "") else num(b, "grade", 0, 100)
+    rec["comment"] = str(b.get("comment", ""))[:500]
+    return {}
+
+
 POST = {
     "/api/order": api_order, "/api/order/cancel": api_order_cancel,
     "/api/loan/propose": api_loan_propose, "/api/loan/respond": api_loan_respond,
@@ -762,6 +1116,8 @@ POST = {
     "/api/admin/team/delete": a_team_delete, "/api/admin/asset": a_asset_save, "/api/admin/prices": a_prices,
     "/api/admin/settle": a_settle, "/api/admin/undo": a_undo, "/api/admin/reset": a_reset,
     "/api/admin/grade": a_grade, "/api/admin/event": a_event,
+    "/api/accounting/preview": api_acct_preview, "/api/accounting/submit": api_acct_submit,
+    "/api/accounting/get": api_acct_get, "/api/admin/accounting/grade": a_acct_grade,
 }
 
 

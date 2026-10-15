@@ -96,9 +96,9 @@ function allocBar(a){
 function boardTable(){
   const b=ST.board;if(!b.length)return`<p class="mute">第一次结算后显示排行榜。</p>`;
   const me=ST.me?.id;
-  return`<div class="scroll"><table><tr><th>排名</th><th>小组</th><th>净资产</th><th>收益率</th><th>最大回撤</th><th>周波动</th><th>违约</th><th>强平</th><th>综合评分</th></tr>
-  ${b.map(r=>`<tr ${r.id===me?'style="font-weight:600"':''}><td>${r.rank}</td><td>${esc(r.name)}</td><td>${fm(r.nav)}</td><td>${sg(r.ret)}</td><td>${pc(r.mdd)}</td><td>${pc(r.vol)}</td><td>${r.defaults}</td><td>${r.forced}</td><td>${fm(r.score,1)}</td></tr>`).join("")}</table></div>
-  <p class="mute" style="font-size:12px">综合评分 = 收益率${ST.config.w_ret}% + 风险控制${ST.config.w_risk}%(回撤+波动) + 流动性${ST.config.w_liq}% + 信用${ST.config.w_credit}% + 报告${ST.config.w_report}%。收益率得分按各组相对高低线性映射。</p>`;
+  return`<div class="scroll"><table><tr><th>排名</th><th>小组</th><th>净资产</th><th>收益率</th><th>最大回撤</th><th>周波动</th><th>违约</th><th>强平</th><th>会计分</th><th>综合评分</th></tr>
+  ${b.map(r=>`<tr ${r.id===me?'style="font-weight:600"':''}><td>${r.rank}</td><td>${esc(r.name)}</td><td>${fm(r.nav)}</td><td>${sg(r.ret)}</td><td>${pc(r.mdd)}</td><td>${pc(r.vol)}</td><td>${r.defaults}</td><td>${r.forced}</td><td>${ST.config.accounting_enabled?fm(r.s_accounting,1):"-"}</td><td>${fm(r.score,1)}</td></tr>`).join("")}</table></div>
+  <p class="mute" style="font-size:12px">综合评分 = 收益率${ST.config.w_ret}% + 风险控制${ST.config.w_risk}%(回撤+波动) + 流动性${ST.config.w_liq}% + 信用${ST.config.w_credit}% + 报告${ST.config.w_report}%${ST.config.accounting_enabled?" + 会计作业"+ST.config.w_accounting+"%":""}。收益率得分按各组相对高低线性映射。</p>`;
 }
 function events(){return ST.events.length?ST.events.slice().sort((a,b)=>b.week-a.week).map(e=>`<div class="event"><b>第${e.week}周事件</b>：${esc(e.text)}</div>`).join(""):""}
 function lastPrice(id){const ws=Object.keys(ST.prices).map(Number).sort((a,b)=>a-b);for(let i=ws.length-1;i>=0;i--){const p=ST.prices[ws[i]][id];if(p)return p}return 0}
@@ -106,7 +106,7 @@ function prevPrice(id){const ws=Object.keys(ST.prices).map(Number).sort((a,b)=>b
 function weekBadge(){return ST.finished?`<span class="tag bad">已结束</span>`:`<span class="tag ok">第 ${ST.week} / ${ST.config.total_weeks} 周 · 交易进行中</span>`}
 
 /* ---------- team ---------- */
-const TEAM_TABS=[["dash","总览"],["trade","交易"],["loans","同业拆借"],["report","投资报告"],["board","排行榜"]];
+const TEAM_TABS=[["dash","总览"],["trade","交易"],["loans","同业拆借"],["report","投资报告"],["accounting","会计结账"],["board","排行榜"]];
 function teamView(){
   const m=ST.me,a=m.acct,c=ST.config;if(!tab)tab="dash";
   let h="";
@@ -126,6 +126,7 @@ function teamView(){
     h=events()+`<div class="card"><h2>第 ${ST.week} 周投资说明</h2><p class="mute">建议 100–300 字：投资逻辑、宏观判断、买卖理由、风险点、下周计划。</p>
     <textarea id="rep">${esc(r.text||"")}</textarea><div class="row"><button class="b" onclick="act('/api/report',{text:$('#rep').value},'已保存')">保存</button></div></div>
     <div class="card"><h2>历史报告与评分</h2>${Object.keys(m.reports).sort((a,b)=>b-a).map(w=>{const r=m.reports[w];return`<h3>第${w}周 ${r.grade!=null?`<span class="tag ok">${r.grade} 分</span>`:""}</h3><div>${esc(r.text||"(未提交)")}</div>${r.comment?`<div class="mute">老师评语：${esc(r.comment)}</div>`:""}`}).join("")||'<p class="mute">暂无</p>'}</div>`}
+  if(tab==="accounting")h=accountingView(m);
   if(tab==="board")h=`<div class="card"><h2>排行榜</h2>${boardTable()}</div>`;
   return h;
 }
@@ -184,7 +185,7 @@ function propose(){
 }
 
 /* ---------- admin ---------- */
-const ADMIN_TABS=[["ov","总览/结算"],["teams","小组管理"],["assets","资产与价格"],["rules","规则设置"],["rep","报告与事件"],["board","排行榜"]];
+const ADMIN_TABS=[["ov","总览/结算"],["teams","小组管理"],["assets","资产与价格"],["rules","规则设置"],["rep","报告与事件"],["acct","会计作业"],["board","排行榜"]];
 function adminView(){
   if(!tab)tab="ov";const c=ST.config,T=Object.values(ST.teams);
   if(tab==="ov"){
@@ -213,6 +214,7 @@ function adminView(){
     <div class="card"><h2>投资报告评分</h2>${T.map(t=>Object.keys(t.reports).sort((a,b)=>b-a).map(w=>{const r=t.reports[w];return`<div style="border-bottom:1px solid var(--line);padding:8px 0"><b>${esc(t.name)}</b> 第${w}周 <span class="mute">${esc(r.by||"")}</span><div>${esc(r.text||"(空)")}</div>
     <div class="row"><input type="number" id="g_${t.id}_${w}" placeholder="0-100" value="${r.grade??""}" style="width:80px"><input id="gc_${t.id}_${w}" placeholder="评语" value="${esc(r.comment||"")}" style="flex:1"><button class="b s" onclick="act('/api/admin/grade',{team:'${t.id}',week:${w},grade:$('#g_${t.id}_${w}').value,comment:$('#gc_${t.id}_${w}').value},'已保存')">评分</button></div></div>`}).join("")).join("")||'<p class="mute">暂无报告</p>'}</div>`;
   }
+  if(tab==="acct")return accountingAdmin();
   if(tab==="board")return`<div class="card"><h2>排行榜</h2>${boardTable()}</div>`;
 }
 function saveTeam(id){act("/api/admin/team",{id,name:$("#tn_"+id).value,code:$("#tc_"+id).value,members:$("#tm_"+id).value.split(/[,，]/)},"已保存")}
@@ -247,8 +249,8 @@ function rulesAdmin(){
   <h3>基础</h3><div class="row"><label class="f">标题<input data-k="title" value="${esc(c.title)}" style="width:280px"></label>${F("initial_cash","每组初始资金 HKD")}${F("total_weeks","总周数")}${F("fee_rate","交易费率 %",1)}${F("cash_rate","现金年化利率 %",1)}${F("bond_yield","国债年化收益 %",1)}</div>
   <h3>持仓限制（占净资产）</h3><div class="row">${F("max_single","单只股票上限 %",1)}${F("max_stock_total","股票总仓位上限 %",1)}${F("max_gold","黄金上限 %",1)}${F("max_bond","国债上限 %",1)}${F("min_cash","最低现金 %",1)}</div>
   <h3>借贷</h3><div class="row">${F("debt_max","总负债上限 %",1)}${F("cp_max","单一对手方上限 %",1)}${F("lend_max","总放贷上限 %",1)}${F("rate_min","最低年化 %",1)}${F("rate_max","最高年化 %",1)}${F("liq_penalty","强平罚金 %",1)}<label class="f">可选期限(周, 逗号分隔)<input data-k="durations" value="${c.durations.join(",")}"></label></div>
-  <h3>评分权重</h3><div class="row">${F("w_ret","收益率")}${F("w_risk","风险控制")}${F("w_liq","流动性")}${F("w_credit","信用")}${F("w_report","报告")}</div>
-  <h3>其他</h3><div class="row"><label><input type="checkbox" data-k="self_join" data-bool=1 ${c.self_join?"checked":""}> 允许学生自助加入小组（关闭则只有名单内成员能登录）</label><label class="f">管理员密码（留空不改）<input id="newpw" type="password"></label></div>
+  <h3>评分权重</h3><div class="row">${F("w_ret","收益率")}${F("w_risk","风险控制")}${F("w_liq","流动性")}${F("w_credit","信用")}${F("w_report","报告")}${F("w_accounting","会计作业")}</div>
+  <h3>其他</h3><div class="row"><label><input type="checkbox" data-k="accounting_enabled" data-bool=1 ${c.accounting_enabled?"checked":""}> 启用会计结账</label><label><input type="checkbox" data-k="accounting_lock_trade" data-bool=1 ${c.accounting_lock_trade?"checked":""}> 未提交上周会计结账不能下单</label><label><input type="checkbox" data-k="self_join" data-bool=1 ${c.self_join?"checked":""}> 允许学生自助加入小组（关闭则只有名单内成员能登录）</label><label class="f">管理员密码（留空不改）<input id="newpw" type="password"></label></div>
   <p class="mute">修改总周数后，请在“资产与价格”里重新生成或导入价格。修改初始资金只影响之后新建的小组/重置后的游戏。</p>
   <button class="b" onclick="saveRules()">保存规则</button></div>`;
 }
@@ -259,10 +261,99 @@ function saveRules(){
   act("/api/admin/config",{config:cfg,admin_password:$("#newpw").value},"规则已保存");
 }
 
+/* ---------- accounting ---------- */
+const AX_STATUS=r=>!r?'<span class="tag">未提交</span>':r.status==="returned"?'<span class="tag bad">已退回</span>':r.grade!=null?`<span class="tag ok">已评分 ${r.grade}</span>`:'<span class="tag wn">已提交·待评分</span>';
+const assetName=id=>(ST.assets.find(a=>a.id===id)||{}).name||id;
+function stmtTable(rows,total,label){return rows.map(([n,v])=>`<tr><td>${esc(n)}</td><td>${fm(v)}</td></tr>`).join("")+(label?`<tr style="font-weight:600"><td>${label}</td><td>${fm(total)}</td></tr>`:"")}
+function resultHtml(res){
+  if(!res)return"";
+  const s=res.statements,bs=s.balance_sheet,is=s.income_statement,oc=s.oci_statement,rc=s.recon;
+  const warn=res.warnings.length?`<div class="card"><h2>系统提示 <span class="tag wn">${res.warnings.length}</span></h2>${res.warnings.map(w=>`<div class="warn">• ${esc(w)}</div>`).join("")}<p class="mute" style="font-size:12px">提示不会阻止提交，老师评分时会参考。</p></div>`:"";
+  const jr=res.journals.map(j=>j.lines.map((l,i)=>`<tr><td>${i?"":esc(j.summary)}</td><td style="text-align:left;padding-left:${l.drcr==="Dr"?8:28}px">${l.drcr==="Dr"?"借":"贷"}：${esc(l.account)}</td><td>${l.drcr==="Dr"?fm(l.amount):""}</td><td>${l.drcr==="Cr"?fm(l.amount):""}</td></tr>`).join("")).join("");
+  return warn+`<div class="card"><h2>会计分录（第 ${res.ctx.week} 周，系统自动生成）</h2><div class="scroll"><table class="tl"><tr><th>摘要</th><th>科目</th><th style="text-align:right">借方</th><th style="text-align:right">贷方</th></tr>${jr||'<tr><td colspan=4 class="mute">本周无分录</td></tr>'}</table></div></div>
+  <div class="grid g2"><div class="card"><h2>资产负债表</h2><table><tr><th colspan=2 style="text-align:left">资产</th></tr>${stmtTable(bs.assets,bs.total_assets,"资产合计")}
+  <tr><th colspan=2 style="text-align:left">负债</th></tr>${stmtTable(bs.liabilities,bs.total_liabilities,"负债合计")}
+  <tr><th colspan=2 style="text-align:left">所有者权益</th></tr>${stmtTable(bs.equity,bs.total_equity,"权益合计")}</table></div>
+  <div><div class="card"><h2>利润表（本周）</h2><table>${stmtTable(is.items,is.net_profit,"净利润")}</table></div>
+  <div class="card"><h2>其他综合收益表</h2><table>${stmtTable(oc.items,oc.total,"本周其他综合收益")}<tr><td class="mute">累计其他综合收益(期末)</td><td>${fm(oc.closing)}</td></tr></table></div></div></div>
+  <p class="mute" style="font-size:12px">对账：排行榜口径净资产(按市价) ${fm(rc.system_nav)}，账面所有者权益 ${fm(rc.book_equity)}，差异 ${fm(rc.diff)}。差异来自按成本/摊余成本计量、不随市价调整的资产（AC、存货），属正常的会计口径差异。</p>`;
+}
+function accountingView(m){
+  const ws=m.hist.filter(x=>x.week>=1).map(x=>x.week);
+  if(!ws.length)return`<div class="card"><h2>会计结账</h2><p class="mute">老师完成第一次结算后，这里会出现第 1 周的会计作业。</p></div>`;
+  const first=ws.find(x=>m.accounting[x]?.status!=="submitted");
+  const w=ui.axw??(first??ws[ws.length-1]);
+  const head=`<div class="card"><h2>会计结账</h2><p class="mute">你负责<b>会计判断</b>（分类、减值、信用损失），系统负责记账和出报表。必须按周顺序完成；老师评分后不能再改。</p>
+  <div class="row"><label class="f">周次<select onchange="ui.axw=+this.value;ui.ax=null;render()">${ws.map(x=>`<option value="${x}" ${x==w?"selected":""}>第${x}周</option>`).join("")}</select></label>${AX_STATUS(m.accounting[w])}</div></div>`;
+  if(!ui.ax||ui.ax.week!==w){loadAcct(w);return head+`<div class="card mute">加载中…</div>`}
+  const X=ui.ax;if(X.loading)return head+`<div class="card mute">加载中…</div>`;
+  if(X.err&&!X.res)return head+`<div class="card warn">${esc(X.err)}</div>`;
+  const rec=X.rec||{},ro=rec.grade!=null,ctx=X.res.ctx,dv=(k,id,f)=>X.dec?.[k]?.[id]?.[f];
+  const dis=ro?"disabled":"";
+  const cls=ctx.assets.map(a=>{const cur=dv("classes",a.id,"cls")||a.cls;
+    return`<tr><td>${esc(a.name)}</td><td>${fm(a.qty_open)}</td><td>${fm(a.bought)} / ${fm(a.sold)}</td><td>${fm(a.qty)}</td>
+    <td>${a.locked?`<span class="tag">${a.cls} 沿用</span>`:`<select ${dis} data-ax="classes" data-id="${a.id}" data-f="cls" onchange="axSync()">${Object.entries(ctx.classes).map(([k,n])=>`<option value="${k}" ${k===cur?"selected":""}>${esc(n)}${a.allowed.includes(k)?"":"（通常不适用）"}</option>`).join("")}</select>`}</td>
+    <td>${a.locked?"":`<input ${dis} data-ax="classes" data-id="${a.id}" data-f="reason" value="${esc(dv("classes",a.id,"reason")||"")}" placeholder="分类理由/持有意图" oninput="axSync()" style="width:200px">`}</td></tr>`}).join("");
+  const imp=ctx.assets.filter(a=>a.qty>0).map(a=>`<tr><td>${esc(a.name)} <span class="tag">${a.cls}</span></td><td>${fm(a.cost)}</td><td>${fm(a.mv)}</td><td>${sgAmt(a.unrealized)}</td>
+    <td><input ${dis} type="number" min="0" data-ax="impair" data-id="${a.id}" data-f="amount" value="${dv("impair",a.id,"amount")??""}" oninput="axSync()"></td>
+    <td><input ${dis} data-ax="impair" data-id="${a.id}" data-f="reason" value="${esc(dv("impair",a.id,"reason")||"")}" placeholder="减值/跌价依据" oninput="axSync()" style="width:200px"></td></tr>`).join("");
+  const ecl=ctx.loans.map(l=>`<tr><td>${esc(l.cp)} <span class="mute">${l.id}</span></td><td>${fm(l.principal)}</td><td>${pc(l.rate)}</td><td>第${l.due}周</td><td>${fm(l.allow)}</td>
+    <td><input ${dis} type="number" min="0" data-ax="ecl" data-id="${l.id}" data-f="amount" value="${dv("ecl",l.id,"amount")??""}" oninput="axSync()"></td>
+    <td><input ${dis} data-ax="ecl" data-id="${l.id}" data-f="reason" value="${esc(dv("ecl",l.id,"reason")||"")}" placeholder="信用风险判断依据" oninput="axSync()" style="width:200px"></td></tr>`).join("");
+  return head+(rec.comment?`<div class="event"><b>老师评语</b>：${esc(rec.comment)}</div>`:"")+`
+  <div class="card"><h2>一、投资分类</h2><p class="mute">新买入的资产需要选择会计分类并说明持有意图；已分类的资产沿用，不得随意重分类。</p>
+  <div class="scroll"><table class="tl"><tr><th>资产</th><th>期初</th><th>本周买/卖</th><th>期末</th><th>分类</th><th>理由</th></tr>${cls||'<tr><td colspan=6 class="mute">无投资</td></tr>'}</table></div></div>
+  <div class="card"><h2>二、减值 / 跌价准备</h2><p class="mute">仅对 AC（减值准备）、FVOCI（损失转入损益）、存货（跌价准备）有效；FVTPL 的下跌已通过公允价值变动入账。不计提请留空。</p>
+  <div class="scroll"><table class="tl"><tr><th>资产</th><th>成本(扣准备)</th><th>市值</th><th>未实现损益</th><th>计提金额</th><th>理由</th></tr>${imp||'<tr><td colspan=6 class="mute">无持仓</td></tr>'}</table></div></div>
+  <div class="card"><h2>三、贷款预期信用损失（放款方）</h2>
+  <div class="scroll"><table class="tl"><tr><th>对手方</th><th>本金</th><th>年化</th><th>到期</th><th>已计提</th><th>本次追加</th><th>依据</th></tr>${ecl||'<tr><td colspan=7 class="mute">本周末没有未到期的放款</td></tr>'}</table></div></div>
+  <div class="card"><h2>四、会计说明与提交</h2><textarea ${dis} id="axnotes" oninput="ui.ax.notes=this.value" placeholder="说明本周主要会计判断：为什么这样分类、为什么计提/不计提、信用风险判断…">${esc(X.notes??rec.notes??"")}</textarea>
+  <div class="row"><button class="b o" onclick="axPreview()" ${dis}>预览分录和报表</button><button class="b" onclick="axSubmit()" ${dis}>${rec.status==="submitted"?"重新提交":"提交会计结账"}</button>${rec.submitted_by?`<span class="mute">上次提交：${esc(rec.submitted_by)}</span>`:""}</div></div>`+resultHtml(X.res);
+}
+function sgAmt(v){return`<span class="${v>=0?'up':'down'}">${v>=0?'+':''}${fm(v)}</span>`}
+async function loadAcct(w){
+  ui.ax={week:w,loading:true};
+  try{
+    const rec=await api("/api/accounting/get",{week:w});
+    const dec=rec.decisions||{};let res=null,err=null;
+    try{res=await api("/api/accounting/preview",{week:w,decisions:dec})}catch(e){err=e.message}
+    ui.ax={week:w,rec,dec,res,err,notes:rec.notes};
+  }catch(e){ui.ax={week:w,err:e.message}}
+  render();
+}
+function axCollect(){const d={classes:{},impair:{},ecl:{}};
+  document.querySelectorAll("[data-ax]").forEach(e=>{const t=d[e.dataset.ax];(t[e.dataset.id]=t[e.dataset.id]||{})[e.dataset.f]=e.value});return d}
+function axSync(){ui.ax.dec=axCollect()}
+async function axPreview(){axSync();try{ui.ax.res=await api("/api/accounting/preview",{week:ui.ax.week,decisions:ui.ax.dec});render();toast("预览已更新，向下查看分录和报表")}catch(e){toast(e.message,true)}}
+async function axSubmit(){axSync();try{await api("/api/accounting/submit",{week:ui.ax.week,decisions:ui.ax.dec,notes:$("#axnotes").value});toast("会计结账已提交");ui.ax=null;await refresh()}catch(e){toast(e.message,true)}}
+
+function accountingAdmin(){
+  const T=Object.values(ST.teams),n=ST.config.total_weeks,settled=ST.finished?n:ST.week-1;
+  if(settled<1)return`<div class="card"><h2>会计作业</h2><p class="mute">完成第一次结算后，这里显示各组提交情况。</p></div>`;
+  const ws=Array.from({length:settled},(_,i)=>i+1);
+  let h=`<div class="card"><h2>会计作业提交状态 <span class="mute" style="font-weight:400">（点击单元格查看/评分）</span></h2><div class="scroll"><table><tr><th>小组</th>${ws.map(w=>`<th>第${w}周</th>`).join("")}<th>平均分</th></tr>
+  ${T.map(t=>{const gs=Object.values(t.accounting).map(r=>r.grade).filter(g=>g!=null);return`<tr><td>${esc(t.name)}</td>${ws.map(w=>`<td style="cursor:pointer" onclick="aaOpen('${t.id}',${w})">${AX_STATUS(t.accounting[w])}</td>`).join("")}<td>${gs.length?fm(gs.reduce((a,b)=>a+b,0)/gs.length,1):"-"}</td></tr>`}).join("")}</table></div></div>`;
+  const A=ui.aa;if(!A)return h;
+  const t=ST.teams[A.team];if(!t)return h;
+  if(A.loading||!A.data)return h+`<div class="card mute">加载中…</div>`;
+  const r=A.data,d=r.decisions||{};
+  const dt=(k,cols)=>{const rows=Object.entries(d[k]||{}).filter(([,v])=>v&&(v.cls||v.amount>0||v.reason));return rows.length?`<table class="tl"><tr><th>${cols}</th><th>选择/金额</th><th>理由</th></tr>${rows.map(([id,v])=>`<tr><td>${esc(k==="ecl"?id:assetName(id))}</td><td>${esc(v.cls??v.amount??"")}</td><td style="white-space:normal">${esc(v.reason||"")}</td></tr>`).join("")}</table>`:'<p class="mute">无</p>'};
+  const res=r.journals?{journals:r.journals,statements:r.statements,warnings:r.warnings||[],ctx:{week:A.week}}:null;
+  return h+`<div class="card"><h2>${esc(t.name)} · 第 ${A.week} 周 ${AX_STATUS(r.status?r:null)}</h2>${!r.status?'<p class="mute">该组尚未提交。</p>':`<p class="mute">提交人：${esc(r.submitted_by||"-")}</p>
+  <h3>投资分类</h3>${dt("classes","资产")}<h3>减值/跌价准备</h3>${dt("impair","资产")}<h3>贷款信用损失</h3>${dt("ecl","贷款")}
+  <h3>会计说明</h3><div style="white-space:pre-wrap">${esc(r.notes||"(空)")}</div>
+  <div class="row" style="margin-top:12px"><input type="number" id="aa_g" min="0" max="100" placeholder="0-100" value="${r.grade??""}" style="width:90px"><input id="aa_c" placeholder="评语" value="${esc(r.comment||"")}" style="flex:1">
+  <button class="b" onclick="aaGrade(false)" ${r.journals?"":"disabled"}>保存评分</button><button class="b r" onclick="if(confirm('退回后学生需重新提交，已有评分将清除。确认？'))aaGrade(true)">退回修改</button></div>`}</div>`+(res?resultHtml(res):"");
+}
+async function aaOpen(team,week){ui.aa={team,week,loading:true};render();
+  try{const data=await api("/api/accounting/get",{team,week});ui.aa={team,week,data}}catch(e){toast(e.message,true);ui.aa=null}render()}
+async function aaGrade(ret){const A=ui.aa;
+  try{await api("/api/admin/accounting/grade",{team:A.team,week:A.week,grade:$("#aa_g").value,comment:$("#aa_c").value,action:ret?"return":""});toast(ret?"已退回":"已保存");await refresh();aaOpen(A.team,A.week)}catch(e){toast(e.message,true)}}
+
 /* ---------- shell ---------- */
 function render(keepFocus){
   if(!token||!ST)return renderLogin();
-  const adm=ST.role==="admin",tabs=adm?ADMIN_TABS:TEAM_TABS;
+  const adm=ST.role==="admin",tabs=(adm?ADMIN_TABS:TEAM_TABS).filter(t=>ST.config.accounting_enabled||!["accounting","acct"].includes(t[0]));
   if(!tab)tab=tabs[0][0];
   const ae=document.activeElement,fid=ae&&ae.id,pos=ae&&ae.selectionStart;
   $("#app").innerHTML=`<header><h1>🏦 ${esc(ST.config.title)}</h1><nav>${tabs.map(([k,l])=>`<button class="${tab===k?'on':''}" onclick="tab='${k}';render()">${l}</button>`).join("")}</nav><span class="sp"></span>
