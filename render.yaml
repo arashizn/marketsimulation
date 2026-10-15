@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: market-simulation
+    runtime: python
+    plan: starter            # 持久化磁盘需要付费实例; free 实例重启后数据会丢失
+    startCommand: python server.py
+    healthCheckPath: /
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false          # 在 Render 控制台手动填写, 不要写进仓库
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: simdata
+      mountPath: /var/data
+      sizeGB: 1

@@ -14,14 +14,17 @@ import secrets
 import socket
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(ROOT, "data")
+DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(ROOT, "data")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 UNDO_FILE = os.path.join(DATA_DIR, "undo.json")
 LOCK = threading.RLock()
+FAILS = {}  # 登录失败记录 ip -> [时间戳]
+MAX_FAILS, FAIL_WINDOW = 8, 300  # 5 分钟内最多失败 8 次
 SESSIONS = {}  # token -> {role, team, name}
 
 DEFAULT_CONFIG = dict(
@@ -494,9 +497,25 @@ def num(body, key, lo=None, hi=None):
     return v
 
 
-def api_login(sess, b):
+def check_rate(ip):
+    now = time.time()
+    FAILS[ip] = [x for x in FAILS.get(ip, []) if now - x < FAIL_WINDOW]
+    if len(FAILS[ip]) >= MAX_FAILS:
+        raise ApiError("登录失败次数过多, 请 5 分钟后再试")
+
+
+def api_login(sess, b, ip="-"):
+    check_rate(ip)
+    try:
+        return _login(b)
+    except ApiError:
+        FAILS.setdefault(ip, []).append(time.time())
+        raise
+
+
+def _login(b):
     if b.get("admin"):
-        if b.get("password") != S["admin_password"]:
+        if not secrets.compare_digest(str(b.get("password", "")), str(S["admin_password"])):
             raise ApiError("管理员密码错误")
         tok = secrets.token_urlsafe(16)
         SESSIONS[tok] = dict(role="admin", name="admin")
@@ -1135,6 +1154,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def client_ip(self):
+        fwd = self.headers.get("X-Forwarded-For", "")  # 部署在 Render 等反向代理后面时取真实 IP
+        return fwd.split(",")[0].strip() if fwd else self.client_address[0]
+
     def session(self):
         return SESSIONS.get(self.headers.get("X-Token", ""))
 
@@ -1161,7 +1184,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             with LOCK:
                 if path == "/api/login":
-                    res = api_login(None, body)
+                    res = api_login(None, body, self.client_ip())
                 else:
                     sess = self.session()
                     if not sess:
@@ -1190,13 +1213,17 @@ def lan_ip():
 
 
 S = load()
+if os.environ.get("ADMIN_PASSWORD"):  # 部署时用环境变量设置, 每次启动覆盖
+    S["admin_password"] = os.environ["ADMIN_PASSWORD"]
 if not S["teams"]:  # 没有任何小组时: 预置 1 个小组, 口令 GROUP1
     new_team("第1组", "GROUP1")
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", 8000))
     with LOCK:
         save()
     print(f"Market Simulation 已启动\n  本机:   http://localhost:{port}\n  局域网: http://{lan_ip()}:{port}  (学生用这个地址)")
-    print(f"  管理员密码: {S['admin_password']}   数据文件: {STATE_FILE}")
+    print(f"  数据文件: {STATE_FILE}")
+    if not os.environ.get("ADMIN_PASSWORD"):
+        print(f"  管理员密码: {S['admin_password']}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
