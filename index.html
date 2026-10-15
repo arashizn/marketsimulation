@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Market Simulation</title>
+<style>
+:root{--bg:#f4f6f9;--card:#fff;--ink:#1c2430;--mute:#6b7685;--line:#e2e7ee;--brand:#1f4e8c;--up:#0a8f5b;--down:#d1333f;--warn:#b7791f}
+@media (prefers-color-scheme:dark){:root{--bg:#10151c;--card:#19212b;--ink:#e6ebf2;--mute:#8d99a9;--line:#2a3441;--brand:#5b9bf0;--up:#3ec48b;--down:#f06a74;--warn:#e0a63c}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+header{background:var(--card);border-bottom:1px solid var(--line);padding:10px 20px;display:flex;gap:16px;align-items:center;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+header h1{font-size:16px;margin:0;color:var(--brand)}header .sp{flex:1}
+nav{display:flex;gap:4px;flex-wrap:wrap}nav button{background:none;border:0;padding:6px 12px;border-radius:6px;cursor:pointer;color:var(--mute);font:inherit}
+nav button.on{background:var(--brand);color:#fff}
+main{max-width:1200px;margin:0 auto;padding:16px 20px 60px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 12px}.card h3{font-size:13px;margin:14px 0 6px;color:var(--mute)}
+.grid{display:grid;gap:16px}.g2{grid-template-columns:1fr 1fr}.g4{grid-template-columns:repeat(4,1fr)}
+@media(max-width:800px){.g2,.g4{grid-template-columns:1fr 1fr}}@media(max-width:520px){.g2,.g4{grid-template-columns:1fr}}
+.kpi .l{color:var(--mute);font-size:12px}.kpi .v{font-size:20px;font-weight:600}
+table{width:100%;border-collapse:collapse}th,td{padding:6px 8px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--mute);font-weight:500;font-size:12px}th:first-child,td:first-child{text-align:left}
+.tl th,.tl td{text-align:left}.scroll{overflow-x:auto}
+.up{color:var(--up)}.down{color:var(--down)}.mute{color:var(--mute)}.warn{color:var(--warn)}
+input,select,textarea{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);max-width:100%}
+input[type=number]{width:110px}textarea{width:100%;min-height:90px}
+button.b{background:var(--brand);color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font:inherit}
+button.b.s{padding:3px 10px;font-size:12px}button.b.r{background:var(--down)}button.b.g{background:var(--up)}button.b.o{background:none;color:var(--brand);border:1px solid var(--brand)}
+button:disabled{opacity:.4;cursor:not-allowed}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;background:var(--line);color:var(--mute)}
+.tag.ok{background:rgba(10,143,91,.15);color:var(--up)}.tag.bad{background:rgba(209,51,63,.15);color:var(--down)}.tag.wn{background:rgba(183,121,31,.18);color:var(--warn)}
+.bar{height:14px;display:flex;border-radius:7px;overflow:hidden;background:var(--line)}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-top:6px;color:var(--mute)}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+.login{max-width:420px;margin:12vh auto}.err{color:var(--down);min-height:20px}
+#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 18px;border-radius:8px;display:none;z-index:20;max-width:90vw}
+.event{border-left:3px solid var(--warn);padding:6px 12px;background:rgba(183,121,31,.1);border-radius:4px;margin:6px 0}
+label.f{display:flex;flex-direction:column;font-size:12px;color:var(--mute);gap:2px}
+svg text{fill:var(--mute);font-size:11px}
+</style>
+</head>
+<body>
+<div id="app"></div><div id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fm=(n,d=0)=>(n==null||isNaN(n))?"-":Number(n).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+const pc=(n,d=2)=>(n==null||isNaN(n))?"-":(n*100).toFixed(d)+"%";
+const sg=(n,d=2)=>`<span class="${n>=0?'up':'down'}">${n>=0?'+':''}${(n*100).toFixed(d)}%</span>`;
+const COLORS={cash:"#8a94a3",stock:"#1f4e8c",gold:"#d4a017",bond:"#2a9d8f",loan:"#8e5bd1"};
+let token=sessionStorage.getItem("tok")||"",ST=null,tab="",ui={};
+
+async function api(path,body){
+  const r=await fetch(path,{method:body?"POST":"GET",headers:{"Content-Type":"application/json","X-Token":token},body:body?JSON.stringify(body):undefined});
+  const j=await r.json().catch(()=>({error:"服务器响应异常"}));
+  if(r.status===401&&path!=="/api/login"){token="";sessionStorage.removeItem("tok");ST=null;render();throw new Error(j.error)}
+  if(!r.ok)throw new Error(j.error||"错误");return j;
+}
+function toast(m,bad){const t=$("#toast");t.textContent=m;t.style.background=bad?"var(--down)":"";t.style.color=bad?"#fff":"";t.style.display="block";clearTimeout(t._h);t._h=setTimeout(()=>t.style.display="none",3500)}
+async function act(path,body,ok){try{await api(path,body);if(ok)toast(ok);await refresh()}catch(e){toast(e.message,true)}}
+async function refresh(){try{ST=await api("/api/state");render()}catch(e){if(token)toast(e.message,true)}}
+
+function login(admin){
+  const b=admin?{admin:1,password:$("#pw").value}:{code:$("#code").value,name:$("#nm").value};
+  api("/api/login",b).then(r=>{token=r.token;sessionStorage.setItem("tok",token);tab="";return refresh()}).catch(e=>$("#err").textContent=e.message);
+}
+function renderLogin(){
+  $("#app").innerHTML=`<div class="login card"><h2 style="font-size:18px">🏦 投资银行模拟交易</h2>
+  <h3>小组登录</h3><div class="row"><input id="code" placeholder="小组口令" style="flex:1"><input id="nm" placeholder="你的姓名" style="flex:1"></div>
+  <button class="b" onclick="login(false)">进入</button>
+  <h3 style="margin-top:22px">老师/管理员</h3><div class="row"><input id="pw" type="password" placeholder="管理员密码" style="flex:1"><button class="b o" onclick="login(true)">管理员登录</button></div>
+  <div class="err" id="err"></div></div>`;
+}
+
+/* ---------- charts ---------- */
+function lineChart(series,w=560,h=200){
+  const all=series.flatMap(s=>s.pts.map(p=>p[1]));if(!all.length)return"";
+  let lo=Math.min(...all),hi=Math.max(...all);if(hi-lo<1e-9){lo-=1;hi+=1}const pad=(hi-lo)*.1;lo-=pad;hi+=pad;
+  const xs=series.flatMap(s=>s.pts.map(p=>p[0])),x0=Math.min(...xs),x1=Math.max(...xs,x0+1);
+  const X=x=>40+(x-x0)/(x1-x0)*(w-50),Y=y=>10+(1-(y-lo)/(hi-lo))*(h-30);
+  let g="";for(let i=0;i<=3;i++){const v=lo+(hi-lo)*i/3;g+=`<line x1="40" x2="${w-10}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="36" y="${Y(v)+4}" text-anchor="end">${fm(v,Math.abs(hi)<10?2:0)}</text>`}
+  for(let x=x0;x<=x1;x++)g+=`<text x="${X(x)}" y="${h-6}" text-anchor="middle">W${x}</text>`;
+  const pal=["#1f4e8c","#d1333f","#0a8f5b","#d4a017","#8e5bd1","#2a9d8f","#e76f51","#6b7685"];
+  series.forEach((s,i)=>{const c=s.color||pal[i%pal.length];g+=`<polyline fill="none" stroke="${c}" stroke-width="2" points="${s.pts.map(p=>X(p[0])+","+Y(p[1])).join(" ")}"/>`});
+  const lg=series.length>1?`<div class="legend">${series.map((s,i)=>`<span><i style="background:${s.color||pal[i%pal.length]}"></i>${esc(s.name)}</span>`).join("")}</div>`:"";
+  return`<svg viewBox="0 0 ${w} ${h}" width="100%" style="max-width:${w}px">${g}</svg>${lg}`;
+}
+function allocBar(a){
+  const parts=[["cash","现金",a.cash],["stock","股票",a.stock],["gold","黄金",a.gold],["bond","国债",a.bond],["loan","应收贷款",a.recv]];
+  const tot=parts.reduce((s,p)=>s+Math.max(p[2],0),0)||1;
+  return`<div class="bar">${parts.map(p=>`<div style="width:${Math.max(p[2],0)/tot*100}%;background:${COLORS[p[0]]}" title="${p[1]}"></div>`).join("")}</div>
+  <div class="legend">${parts.map(p=>`<span><i style="background:${COLORS[p[0]]}"></i>${p[1]} ${pc(p[2]/Math.max(a.nav,1)*1,1)}</span>`).join("")}</div>`;
+}
+
+/* ---------- shared ---------- */
+function boardTable(){
+  const b=ST.board;if(!b.length)return`<p class="mute">第一次结算后显示排行榜。</p>`;
+  const me=ST.me?.id;
+  return`<div class="scroll"><table><tr><th>排名</th><th>小组</th><th>净资产</th><th>收益率</th><th>最大回撤</th><th>周波动</th><th>违约</th><th>强平</th><th>综合评分</th></tr>
+  ${b.map(r=>`<tr ${r.id===me?'style="font-weight:600"':''}><td>${r.rank}</td><td>${esc(r.name)}</td><td>${fm(r.nav)}</td><td>${sg(r.ret)}</td><td>${pc(r.mdd)}</td><td>${pc(r.vol)}</td><td>${r.defaults}</td><td>${r.forced}</td><td>${fm(r.score,1)}</td></tr>`).join("")}</table></div>
+  <p class="mute" style="font-size:12px">综合评分 = 收益率${ST.config.w_ret}% + 风险控制${ST.config.w_risk}%(回撤+波动) + 流动性${ST.config.w_liq}% + 信用${ST.config.w_credit}% + 报告${ST.config.w_report}%。收益率得分按各组相对高低线性映射。</p>`;
+}
+function events(){return ST.events.length?ST.events.slice().sort((a,b)=>b.week-a.week).map(e=>`<div class="event"><b>第${e.week}周事件</b>：${esc(e.text)}</div>`).join(""):""}
+function lastPrice(id){const ws=Object.keys(ST.prices).map(Number).sort((a,b)=>a-b);for(let i=ws.length-1;i>=0;i--){const p=ST.prices[ws[i]][id];if(p)return p}return 0}
+function prevPrice(id){const ws=Object.keys(ST.prices).map(Number).sort((a,b)=>b-a);let n=0;for(const w of ws){const p=ST.prices[w][id];if(p){if(n++===1)return p}}return null}
+function weekBadge(){return ST.finished?`<span class="tag bad">已结束</span>`:`<span class="tag ok">第 ${ST.week} / ${ST.config.total_weeks} 周 · 交易进行中</span>`}
+
+/* ---------- team ---------- */
+const TEAM_TABS=[["dash","总览"],["trade","交易"],["loans","同业拆借"],["report","投资报告"],["board","排行榜"]];
+function teamView(){
+  const m=ST.me,a=m.acct,c=ST.config;if(!tab)tab="dash";
+  let h="";
+  if(tab==="dash"){
+    const init=m.hist[0]?.nav||c.initial_cash;
+    h=events()+`<div class="grid g4"><div class="card kpi"><div class="l">净资产</div><div class="v">${fm(a.nav)}</div></div>
+    <div class="card kpi"><div class="l">累计收益率</div><div class="v">${sg(a.nav/init-1)}</div></div>
+    <div class="card kpi"><div class="l">现金（占比 ${pc(a.cash/a.nav,1)}）</div><div class="v">${fm(a.cash)}</div></div>
+    <div class="card kpi"><div class="l">应收 / 应付贷款</div><div class="v" style="font-size:16px">${fm(a.recv)} / ${fm(a.pay)}</div></div></div>
+    <div class="grid g2"><div class="card"><h2>资产配置</h2>${allocBar(a)}</div>
+    <div class="card"><h2>净资产走势</h2>${lineChart([{name:"净资产",pts:m.hist.map(x=>[x.week,x.nav])}])}</div></div>
+    <div class="card"><h2>当前持仓</h2>${holdingsTable(m)}</div>`;
+  }
+  if(tab==="trade")h=tradeView(m);
+  if(tab==="loans")h=loansView(m);
+  if(tab==="report"){const r=m.reports[ST.week]||{};
+    h=events()+`<div class="card"><h2>第 ${ST.week} 周投资说明</h2><p class="mute">建议 100–300 字：投资逻辑、宏观判断、买卖理由、风险点、下周计划。</p>
+    <textarea id="rep">${esc(r.text||"")}</textarea><div class="row"><button class="b" onclick="act('/api/report',{text:$('#rep').value},'已保存')">保存</button></div></div>
+    <div class="card"><h2>历史报告与评分</h2>${Object.keys(m.reports).sort((a,b)=>b-a).map(w=>{const r=m.reports[w];return`<h3>第${w}周 ${r.grade!=null?`<span class="tag ok">${r.grade} 分</span>`:""}</h3><div>${esc(r.text||"(未提交)")}</div>${r.comment?`<div class="mute">老师评语：${esc(r.comment)}</div>`:""}`}).join("")||'<p class="mute">暂无</p>'}</div>`}
+  if(tab==="board")h=`<div class="card"><h2>排行榜</h2>${boardTable()}</div>`;
+  return h;
+}
+function holdingsTable(m){
+  const am=Object.fromEntries(ST.assets.map(a=>[a.id,a]));
+  const rows=Object.entries(m.holdings).filter(([k,q])=>q>0&&am[k]);
+  if(!rows.length)return`<p class="mute">暂无持仓。</p>`;
+  const nav=m.acct.nav;
+  return`<div class="scroll"><table><tr><th>资产</th><th>数量</th><th>成本价</th><th>最新价</th><th>市值</th><th>占净资产</th><th>浮动盈亏</th></tr>
+  ${rows.map(([k,q])=>{const p=lastPrice(k),cost=m.cost[k]||p;return`<tr><td>${esc(am[k].name)}</td><td>${fm(q)}</td><td>${fm(cost,2)}</td><td>${fm(p,2)}</td><td>${fm(q*p)}</td><td>${pc(q*p/nav,1)}</td><td>${sg(p/cost-1)}</td></tr>`}).join("")}</table></div>`;
+}
+function pendingOrders(m){return m.orders.filter(o=>o.week===ST.week&&o.status==="pending")}
+function tradeView(m){
+  const c=ST.config,am=Object.fromEntries(ST.assets.map(a=>[a.id,a]));
+  const pend=pendingOrders(m);
+  const lastSettled=m.orders.filter(o=>o.status!=="pending").slice(-15).reverse();
+  const q=(ui.q||"").toLowerCase();
+  const list=ST.assets.filter(a=>a.enabled&&(!q||(a.name+a.id+a.sector).toLowerCase().includes(q)));
+  return`${events()}<div class="card"><h2>下单 ${weekBadge()}</h2>
+  <p class="mute">本周订单将在老师结算时，按<b>第 ${ST.week} 周收盘价</b>成交（目前看到的是第 ${ST.week-1} 周价格）。先执行卖出，再执行买入；手续费 ${pc(c.fee_rate,2)}。
+  限制：单只股票 ≤ ${pc(c.max_single,0)}，股票总仓位 ≤ ${pc(c.max_stock_total,0)}，黄金 ≤ ${pc(c.max_gold,0)}，国债 ≤ ${pc(c.max_bond,0)}，现金 ≥ ${pc(c.min_cash,0)}。违规订单会被拒绝。</p>
+  <div class="row"><input placeholder="搜索 代码/名称/行业" value="${esc(ui.q||"")}" oninput="ui.q=this.value;render(true)" id="srch"><span class="mute">可用现金 ${fm(m.cash)}</span></div>
+  <div class="scroll"><table><tr><th>资产</th><th>行业</th><th>最新价</th><th>周涨跌</th><th>持仓</th><th>数量</th><th></th></tr>
+  ${list.map(a=>{const p=lastPrice(a.id),pp=prevPrice(a.id);return`<tr><td>${esc(a.name)} <span class="mute">${esc(a.id)}</span></td><td>${esc(a.sector)}</td><td>${fm(p,2)}</td><td>${pp?sg(p/pp-1):"-"}</td><td>${fm(m.holdings[a.id]||0)}</td>
+  <td><input type="number" min="1" step="1" id="q_${a.id.replace(/\W/g,'_')}" placeholder="股数"></td>
+  <td><button class="b s g" ${ST.finished?"disabled":""} onclick="order('${a.id}','buy')">买</button> <button class="b s r" ${ST.finished?"disabled":""} onclick="order('${a.id}','sell')">卖</button></td></tr>`}).join("")}</table></div></div>
+  <div class="card"><h2>本周待执行订单</h2>${pend.length?`<table class="tl"><tr><th>资产</th><th>方向</th><th>数量</th><th>预估金额</th><th></th></tr>${pend.map(o=>`<tr><td>${esc(am[o.asset]?.name||o.asset)}</td><td>${o.side==="buy"?"买入":"卖出"}</td><td>${fm(o.qty)}</td><td>${fm(o.qty*lastPrice(o.asset))}</td><td><button class="b s o" onclick="act('/api/order/cancel',{id:'${o.id}'})">撤销</button></td></tr>`).join("")}</table>`:'<p class="mute">暂无</p>'}</div>
+  <div class="card"><h2>最近成交记录</h2>${lastSettled.length?`<div class="scroll"><table class="tl"><tr><th>周</th><th>资产</th><th>方向</th><th>数量</th><th>成交价</th><th>手续费</th><th>状态</th></tr>${lastSettled.map(o=>`<tr><td>${o.week}</td><td>${esc(am[o.asset]?.name||o.asset)}</td><td>${o.side==="buy"?"买入":"卖出"}</td><td>${fm(o.qty)}</td><td>${o.price?fm(o.price,2):"-"}</td><td>${o.fee?fm(o.fee):"-"}</td><td>${o.status==="filled"?'<span class="tag ok">成交</span>':`<span class="tag bad">拒绝</span> ${esc(o.note||"")}`}</td></tr>`).join("")}</table></div>`:'<p class="mute">暂无</p>'}</div>`;
+}
+function order(id,side){
+  const el=document.getElementById("q_"+id.replace(/\W/g,"_")),qty=parseInt(el.value);
+  if(!qty||qty<1)return toast("请输入股数",true);
+  act("/api/order",{asset:id,side,qty},"订单已提交");
+}
+function loansView(m){
+  const c=ST.config,names=ST.team_names,others=Object.entries(names).filter(([id])=>id!==m.id);
+  const L=m.loans,pend=L.filter(l=>l.status==="pending");
+  const incoming=pend.filter(l=>l.proposer!==m.id),outgoing=pend.filter(l=>l.proposer===m.id);
+  const act_=L.filter(l=>l.status==="active");
+  const desc=l=>`${esc(names[l.lender])} → ${esc(names[l.borrower])}`;
+  return`<div class="card"><h2>发起借贷</h2>
+  <p class="mute">对方确认后立即划款，到期（第 N 周结算时）自动还本付息。利率 ${pc(c.rate_min,0)}–${pc(c.rate_max,0)}，期限 ${c.durations.join("/")} 周。借款方总负债 ≤ 净资产 ${pc(c.debt_max,0)}；单一对手方 ≤ 出借方净资产 ${pc(c.cp_max,0)}；总放贷 ≤ ${pc(c.lend_max,0)}。</p>
+  <div class="row"><label class="f">我要<select id="ln_mode"><option value="borrow">借入</option><option value="lend">借出</option></select></label>
+  <label class="f">对手方<select id="ln_cp">${others.map(([id,n])=>`<option value="${id}">${esc(n)}</option>`).join("")}</select></label>
+  <label class="f">金额 HKD<input type="number" id="ln_p" value="10000000" step="1000000"></label>
+  <label class="f">年化利率 %<input type="number" id="ln_r" value="8" step="0.5"></label>
+  <label class="f">期限(周)<select id="ln_w">${c.durations.map(d=>`<option>${d}</option>`).join("")}</select></label>
+  <button class="b" onclick="propose()">发送申请</button></div></div>
+  <div class="card"><h2>待我确认</h2>${incoming.length?`<table class="tl"><tr><th>方向</th><th>金额</th><th>年化</th><th>期限</th><th>应还利息</th><th></th></tr>${incoming.map(l=>`<tr><td>${desc(l)}</td><td>${fm(l.principal)}</td><td>${pc(l.rate)}</td><td>${l.weeks}周</td><td>${fm(l.principal*l.rate*l.weeks/52)}</td><td><button class="b s g" onclick="act('/api/loan/respond',{id:'${l.id}',action:'accept'},'贷款已生效')">接受</button> <button class="b s r" onclick="act('/api/loan/respond',{id:'${l.id}',action:'reject'})">拒绝</button></td></tr>`).join("")}</table>`:'<p class="mute">暂无</p>'}
+  ${outgoing.length?`<h3>我发出的申请（等待对方）</h3><table class="tl">${outgoing.map(l=>`<tr><td>${desc(l)}</td><td>${fm(l.principal)}</td><td>${pc(l.rate)}</td><td>${l.weeks}周</td><td><button class="b s o" onclick="act('/api/loan/respond',{id:'${l.id}',action:'cancel'})">撤销</button></td></tr>`).join("")}</table>`:""}</div>
+  <div class="card"><h2>生效中的贷款</h2>${act_.length?`<table class="tl"><tr><th>方向</th><th>本金</th><th>年化</th><th>起始</th><th>到期(周)</th><th>到期应还</th></tr>${act_.map(l=>`<tr><td>${desc(l)} ${l.lender===m.id?'<span class="tag ok">我放款</span>':'<span class="tag wn">我借款</span>'}</td><td>${fm(l.principal)}</td><td>${pc(l.rate)}</td><td>${l.start}</td><td>${l.due}</td><td>${fm(l.principal*(1+l.rate*l.weeks/52))}</td></tr>`).join("")}</table>`:'<p class="mute">暂无</p>'}
+  <h3>历史</h3>${L.filter(l=>["repaid","defaulted","rejected","cancelled","expired"].includes(l.status)).map(l=>`<div class="mute">${desc(l)} ${fm(l.principal)} @${pc(l.rate)} ${l.weeks}周 — ${({repaid:"已还清",defaulted:"违约，损失 "+fm(l.loss),rejected:"被拒绝",cancelled:"已撤销",expired:"过期未处理"})[l.status]}</div>`).join("")||'<span class="mute">暂无</span>'}</div>`;
+}
+function propose(){
+  act("/api/loan/propose",{mode:$("#ln_mode").value,counterparty:$("#ln_cp").value,principal:+$("#ln_p").value,rate:+$("#ln_r").value/100,weeks:+$("#ln_w").value},"申请已发送");
+}
+
+/* ---------- admin ---------- */
+const ADMIN_TABS=[["ov","总览/结算"],["teams","小组管理"],["assets","资产与价格"],["rules","规则设置"],["rep","报告与事件"],["board","排行榜"]];
+function adminView(){
+  if(!tab)tab="ov";const c=ST.config,T=Object.values(ST.teams);
+  if(tab==="ov"){
+    const miss=ST.missing_price;
+    return`<div class="card"><h2>游戏进度 ${weekBadge()}</h2>
+    ${ST.finished?'<p>游戏已结束，请查看排行榜。</p>':`<p>当前为第 <b>${ST.week}</b> 周。学生下单后，点击“结算本周”：系统将以<b>第 ${ST.week} 周价格</b>执行订单、结算贷款、公布收益。</p>
+    ${miss.length?`<p class="warn">⚠ 第 ${ST.week} 周尚缺 ${miss.length} 个资产价格：${esc(miss.slice(0,8).join(", "))}${miss.length>8?"…":""} → 请到“资产与价格”录入/导入。</p>`:'<p class="up">✓ 本周价格已齐备</p>'}`}
+    <div class="row"><button class="b" ${ST.finished||miss.length?"disabled":""} onclick="if(confirm('确认结算第${ST.week}周？'))act('/api/admin/settle',{},'结算完成')">结算本周</button>
+    <button class="b o" ${ST.can_undo?"":"disabled"} onclick="if(confirm('撤销最近一次结算？'))act('/api/admin/undo',{},'已撤销')">撤销上次结算</button>
+    <button class="b r" onclick="if(confirm('重置游戏：清空所有交易/贷款/历史，保留小组与资产。确认？'))act('/api/admin/reset',{},'已重置')">重置游戏</button></div></div>
+    <div class="card"><h2>各组本周订单状态</h2><div class="scroll"><table><tr><th>小组</th><th>口令</th><th>成员</th><th>净资产</th><th>待执行订单</th><th>待处理贷款</th><th>本周报告</th></tr>
+    ${T.map(t=>`<tr><td>${esc(t.name)}</td><td><code>${esc(t.code)}</code></td><td>${t.members.length}</td><td>${fm(t.acct.nav)}</td><td>${t.orders.filter(o=>o.week===ST.week&&o.status==="pending").length}</td><td>${ST.loans.filter(l=>l.status==="pending"&&[l.lender,l.borrower].includes(t.id)).length}</td><td>${t.reports[ST.week]?.text?"✓":"-"}</td></tr>`).join("")||'<tr><td colspan=7 class="mute">还没有小组，请到“小组管理”创建</td></tr>'}</table></div></div>
+    <div class="card"><h2>净资产走势（全部小组）</h2>${lineChart(T.map(t=>({name:t.name,pts:t.hist.map(x=>[x.week,x.nav])})),760,240)}</div>`;
+  }
+  if(tab==="teams")return`<div class="card"><h2>批量创建小组</h2><div class="row"><label class="f">数量<input type="number" id="bn" value="4" min="1" max="100"></label><button class="b" onclick="act('/api/admin/teams/batch',{count:+$('#bn').value},'已创建')">创建</button></div>
+  <p class="mute">每组自动生成随机口令。学生用“口令+姓名”登录，姓名自动加入小组（可在规则里关闭自助加入）。</p></div>
+  <div class="card"><h2>小组列表（每组人数不限）</h2>${T.map(t=>`<div class="row" style="border-bottom:1px solid var(--line);padding-bottom:8px">
+  <label class="f">名称<input id="tn_${t.id}" value="${esc(t.name)}"></label><label class="f">口令<input id="tc_${t.id}" value="${esc(t.code)}" style="width:100px"></label>
+  <label class="f" style="flex:1">成员（逗号分隔）<input id="tm_${t.id}" value="${esc(t.members.join(", "))}" style="width:100%"></label>
+  <button class="b s" onclick="saveTeam('${t.id}')">保存</button><button class="b s r" onclick="if(confirm('删除该小组？'))act('/api/admin/team/delete',{id:'${t.id}'})">删除</button></div>`).join("")||'<p class="mute">暂无</p>'}
+  <h3>新增单个小组</h3><div class="row"><input id="nn" placeholder="名称"><input id="nm2" placeholder="成员，逗号分隔" style="flex:1"><button class="b" onclick="act('/api/admin/team',{name:$('#nn').value,members:$('#nm2').value.split(/[,，]/)},'已添加')">添加</button></div></div>`;
+  if(tab==="assets")return assetsAdmin();
+  if(tab==="rules")return rulesAdmin();
+  if(tab==="rep"){
+    return`<div class="card"><h2>发布事件卡</h2><div class="row"><label class="f">周次<input type="number" id="ev_w" value="${ST.week}" min="1" style="width:70px"></label><input id="ev_t" placeholder="例如：美联储宣布加息 25bp（留空删除）" style="flex:1"><button class="b" onclick="act('/api/admin/event',{week:+$('#ev_w').value,text:$('#ev_t').value},'已发布')">发布</button></div>${events()}</div>
+    <div class="card"><h2>投资报告评分</h2>${T.map(t=>Object.keys(t.reports).sort((a,b)=>b-a).map(w=>{const r=t.reports[w];return`<div style="border-bottom:1px solid var(--line);padding:8px 0"><b>${esc(t.name)}</b> 第${w}周 <span class="mute">${esc(r.by||"")}</span><div>${esc(r.text||"(空)")}</div>
+    <div class="row"><input type="number" id="g_${t.id}_${w}" placeholder="0-100" value="${r.grade??""}" style="width:80px"><input id="gc_${t.id}_${w}" placeholder="评语" value="${esc(r.comment||"")}" style="flex:1"><button class="b s" onclick="act('/api/admin/grade',{team:'${t.id}',week:${w},grade:$('#g_${t.id}_${w}').value,comment:$('#gc_${t.id}_${w}').value},'已保存')">评分</button></div></div>`}).join("")).join("")||'<p class="mute">暂无报告</p>'}</div>`;
+  }
+  if(tab==="board")return`<div class="card"><h2>排行榜</h2>${boardTable()}</div>`;
+}
+function saveTeam(id){act("/api/admin/team",{id,name:$("#tn_"+id).value,code:$("#tc_"+id).value,members:$("#tm_"+id).value.split(/[,，]/)},"已保存")}
+function assetsAdmin(){
+  const w=ui.pw??ST.week,n=ST.config.total_weeks;
+  const pr=ST.prices[w]||{};
+  return`<div class="card"><h2>价格管理</h2>
+  <p class="mute">学生只能看到已结算周（≤ 第${ST.week-1}周）的价格，所以提前录入未来价格不会泄露。第 0 周为初始价格。国债价格由年化收益自动累计。</p>
+  <div class="row"><button class="b o" onclick="document.getElementById('csvf').click()">导入 CSV</button><input type="file" id="csvf" accept=".csv,.txt" style="display:none" onchange="importCsv(this)">
+  <button class="b o" onclick="dlTemplate()">下载 CSV 模板</button>
+  <input id="seed" placeholder="随机种子(可空)" style="width:130px"><button class="b o" onclick="if(confirm('用随机游走演示价格覆盖全部价格？'))act('/api/admin/prices',{mode:'generate',seed:$('#seed').value},'已生成演示价格')">生成演示价格</button></div>
+  <p class="mute" style="font-size:12px">CSV 格式：第一列 week（0..${n}），其余列为资产代码（如 0700.HK, GOLD），每行一周的价格（收盘价，HKD）。真实价格可从 Yahoo Finance / 财经网站导出后整理。</p>
+  <h3>手动编辑某一周价格</h3><div class="row"><label class="f">周次<select onchange="ui.pw=+this.value;render()">${Array.from({length:n+1},(_,i)=>`<option ${i==w?"selected":""} value="${i}">第${i}周${i==ST.week?"（当前待结算）":""}</option>`).join("")}</select></label>
+  <button class="b" onclick="savePrices(${w})">保存本周价格</button></div>
+  <div class="scroll"><table><tr><th>资产</th><th>价格</th></tr>${ST.assets.filter(a=>a.enabled&&a.type!=="bond").map(a=>`<tr><td>${esc(a.name)} <span class="mute">${esc(a.id)}</span></td><td><input type="number" step="any" class="pp" data-id="${esc(a.id)}" value="${pr[a.id]??""}"></td></tr>`).join("")}</table></div></div>
+  <div class="card"><h2>资产池</h2><div class="scroll"><table class="tl"><tr><th>代码</th><th>名称</th><th>类型</th><th>行业</th><th>基准价</th><th>启用</th></tr>
+  ${ST.assets.map(a=>`<tr><td>${esc(a.id)}</td><td>${esc(a.name)}</td><td>${a.type}</td><td>${esc(a.sector)}</td><td>${a.base}</td><td><button class="b s ${a.enabled?'g':'o'}" onclick="act('/api/admin/asset',{...${esc(JSON.stringify(a))},enabled:${!a.enabled}})">${a.enabled?"已启用":"已停用"}</button></td></tr>`).join("")}</table></div>
+  <h3>新增 / 修改资产</h3><div class="row"><input id="as_id" placeholder="代码 如 0941.HK" style="width:130px"><input id="as_n" placeholder="名称"><select id="as_t"><option value="stock">股票</option><option value="gold">黄金</option><option value="bond">国债</option></select><input id="as_s" placeholder="行业" style="width:90px"><input id="as_b" type="number" placeholder="基准价" step="any">
+  <button class="b" onclick="act('/api/admin/asset',{id:$('#as_id').value,name:$('#as_n').value,type:$('#as_t').value,sector:$('#as_s').value,base:+$('#as_b').value},'已保存')">保存</button></div></div>`;
+}
+function savePrices(w){const p={};document.querySelectorAll(".pp").forEach(i=>{if(i.value!=="")p[i.dataset.id]=+i.value});act("/api/admin/prices",{mode:"week",week:w,prices:p},"价格已保存")}
+function importCsv(inp){const f=inp.files[0];if(!f)return;const r=new FileReader();r.onload=async()=>{try{const j=await api("/api/admin/prices",{mode:"csv",text:r.result});toast(`导入 ${j.count} 个价格`);refresh()}catch(e){toast(e.message,true)}};r.readAsText(f);inp.value=""}
+function dlTemplate(){
+  const ids=ST.assets.filter(a=>a.enabled&&a.type!=="bond").map(a=>a.id);
+  let s="week,"+ids.join(",")+"\n";for(let w=0;w<=ST.config.total_weeks;w++)s+=w+","+ids.map(i=>ST.prices[w]?.[i]??"").join(",")+"\n";
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["﻿"+s],{type:"text/csv"}));a.download="prices.csv";a.click();
+}
+function rulesAdmin(){
+  const c=ST.config;
+  const F=(k,l,pct,step)=>`<label class="f">${l}<input type="number" step="${step||'any'}" data-k="${k}" ${pct?'data-pct=1':''} value="${pct?+(c[k]*100).toFixed(4):c[k]}"></label>`;
+  return`<div class="card"><h2>规则设置 <span class="mute" style="font-weight:400">（百分比项直接填数字，如 30 表示 30%）</span></h2>
+  <h3>基础</h3><div class="row"><label class="f">标题<input data-k="title" value="${esc(c.title)}" style="width:280px"></label>${F("initial_cash","每组初始资金 HKD")}${F("total_weeks","总周数")}${F("fee_rate","交易费率 %",1)}${F("cash_rate","现金年化利率 %",1)}${F("bond_yield","国债年化收益 %",1)}</div>
+  <h3>持仓限制（占净资产）</h3><div class="row">${F("max_single","单只股票上限 %",1)}${F("max_stock_total","股票总仓位上限 %",1)}${F("max_gold","黄金上限 %",1)}${F("max_bond","国债上限 %",1)}${F("min_cash","最低现金 %",1)}</div>
+  <h3>借贷</h3><div class="row">${F("debt_max","总负债上限 %",1)}${F("cp_max","单一对手方上限 %",1)}${F("lend_max","总放贷上限 %",1)}${F("rate_min","最低年化 %",1)}${F("rate_max","最高年化 %",1)}${F("liq_penalty","强平罚金 %",1)}<label class="f">可选期限(周, 逗号分隔)<input data-k="durations" value="${c.durations.join(",")}"></label></div>
+  <h3>评分权重</h3><div class="row">${F("w_ret","收益率")}${F("w_risk","风险控制")}${F("w_liq","流动性")}${F("w_credit","信用")}${F("w_report","报告")}</div>
+  <h3>其他</h3><div class="row"><label><input type="checkbox" data-k="self_join" data-bool=1 ${c.self_join?"checked":""}> 允许学生自助加入小组（关闭则只有名单内成员能登录）</label><label class="f">管理员密码（留空不改）<input id="newpw" type="password"></label></div>
+  <p class="mute">修改总周数后，请在“资产与价格”里重新生成或导入价格。修改初始资金只影响之后新建的小组/重置后的游戏。</p>
+  <button class="b" onclick="saveRules()">保存规则</button></div>`;
+}
+function saveRules(){
+  const cfg={};document.querySelectorAll("[data-k]").forEach(i=>{const k=i.dataset.k;
+    if(i.dataset.bool)cfg[k]=i.checked;else if(k==="durations")cfg[k]=i.value.split(/[,，]/).map(Number).filter(x=>x>0);
+    else if(k==="title")cfg[k]=i.value;else cfg[k]=i.dataset.pct?+i.value/100:+i.value});
+  act("/api/admin/config",{config:cfg,admin_password:$("#newpw").value},"规则已保存");
+}
+
+/* ---------- shell ---------- */
+function render(keepFocus){
+  if(!token||!ST)return renderLogin();
+  const adm=ST.role==="admin",tabs=adm?ADMIN_TABS:TEAM_TABS;
+  if(!tab)tab=tabs[0][0];
+  const ae=document.activeElement,fid=ae&&ae.id,pos=ae&&ae.selectionStart;
+  $("#app").innerHTML=`<header><h1>🏦 ${esc(ST.config.title)}</h1><nav>${tabs.map(([k,l])=>`<button class="${tab===k?'on':''}" onclick="tab='${k}';render()">${l}</button>`).join("")}</nav><span class="sp"></span>
+  ${weekBadge()}<span class="mute">${adm?"管理员":esc(ST.me.name)+" · "+esc(ST.user)}</span><button class="b s o" onclick="refresh()">刷新</button><button class="b s o" onclick="token='';sessionStorage.removeItem('tok');ST=null;tab='';render()">退出</button></header>
+  <main>${adm?adminView():teamView()}</main>`;
+  if(keepFocus&&fid){const e=document.getElementById(fid);if(e){e.focus();try{e.setSelectionRange(pos,pos)}catch{}}}
+}
+setInterval(()=>{const a=document.activeElement;if(token&&!(a&&/INPUT|TEXTAREA|SELECT/.test(a.tagName)))refresh()},15000);
+token?refresh():render();
+</script>
+</body>
+</html>
