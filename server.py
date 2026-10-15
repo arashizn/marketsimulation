@@ -1190,6 +1190,8 @@ def lan_ip():
 
 
 S = load()
+if not S["teams"]:  # 没有任何小组时: 预置 1 个小组, 口令 GROUP1
+    new_team("第1组", "GROUP1")
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
