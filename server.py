@@ -1302,6 +1302,7 @@ if not S["teams"]:  # 没有任何小组时: 预置 1 个小组, 口令 GROUP1
     new_team("第1组", "GROUP1")
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)  # 部署平台上日志不是终端, 否则输出会被缓冲而看不到
     port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", 8000))
     with LOCK:
         save()

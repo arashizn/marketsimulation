@@ -7,6 +7,8 @@ services:
     startCommand: python server.py
     healthCheckPath: /
     envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: ADMIN_PASSWORD
         sync: false          # 在 Render 控制台手动填写, 不要写进仓库
       - key: DATABASE_URL  # 可选: 填 PostgreSQL 连接串后改用数据库存储, 此时可去掉下面的 disk
