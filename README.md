@@ -32,3 +32,11 @@
 - 本程序只适合单实例运行（数据在内存和单个文件里），不要开多个实例。
 - 登录有简单限流（同一 IP 5 分钟内失败 8 次会被暂时拦截），但没有为大规模公网使用做安全加固，建议仅在课程期间开放。
 - 环境变量：`PORT`（端口，Render 自动提供）、`ADMIN_PASSWORD`、`DATA_DIR`。
+
+## 使用 PostgreSQL 存储（可选）
+默认把数据存在 `data/state.json`。设置环境变量 **`DATABASE_URL`**（如 `postgresql://user:pass@host:5432/dbname`）后，改为存入 PostgreSQL 的 `app_state` 表（整个状态一行 JSONB，另一行保存“撤销结算”快照）。
+- 先 `pip install -r requirements.txt`（只有用数据库时才需要驱动；文件模式仍然零依赖）。
+- 数据库为空且本地存在 `data/state.json` 时，启动会自动导入，旧数据不丢。
+- 断线会自动重连。仍然只能单实例运行：状态在内存里，多实例会互相覆盖。
+- Render 上可以在同一账号里新建 PostgreSQL，把 Internal Database URL 填到 `DATABASE_URL`；这样不再需要付费磁盘，但数据库本身免费档有期限，长期使用请选付费档。**不要把 `DATABASE_URL` 写进仓库。**
+- 备份：`pg_dump "$DATABASE_URL" | gzip > backup.sql.gz`。

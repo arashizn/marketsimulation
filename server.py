@@ -83,18 +83,104 @@ def new_state():
     return S
 
 
+# ----------------------------------------------------------------- 存储层
+# 设置环境变量 DATABASE_URL 时使用 PostgreSQL(整个状态存为一行 JSONB), 否则使用 data/ 下的 JSON 文件.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+class FileStore:
+    desc = f"文件 {STATE_FILE}"
+
+    def read(self, key):
+        path = STATE_FILE if key == "main" else UNDO_FILE
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def write(self, key, state):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        path = STATE_FILE if key == "main" else UNDO_FILE
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def delete(self, key):
+        path = STATE_FILE if key == "main" else UNDO_FILE
+        if os.path.exists(path):
+            os.remove(path)
+
+    def exists(self, key):
+        return os.path.exists(STATE_FILE if key == "main" else UNDO_FILE)
+
+
+class PgStore:
+    """PostgreSQL 版: 表 app_state(id, data JSONB). 使用单个长连接, 断线自动重连."""
+    desc = "PostgreSQL (DATABASE_URL)"
+
+    def __init__(self, url):
+        try:
+            import psycopg
+            from psycopg.types.json import Jsonb
+        except ImportError:
+            raise SystemExit("设置了 DATABASE_URL, 但未安装 PostgreSQL 驱动: pip install -r requirements.txt")
+        self._psycopg, self._Jsonb, self.url = psycopg, Jsonb, url
+        self.conn = None
+        self._undo = None  # 缓存 "是否存在 undo", 避免每次 /api/state 都查库
+        self._run("CREATE TABLE IF NOT EXISTS app_state (id TEXT PRIMARY KEY, data JSONB NOT NULL, "
+                  "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+
+    def _run(self, sql, args=None, fetch=False):
+        for attempt in (0, 1):
+            try:
+                if self.conn is None or self.conn.closed:
+                    self.conn = self._psycopg.connect(self.url, autocommit=True, connect_timeout=10)
+                cur = self.conn.execute(sql, args)
+                return cur.fetchone() if fetch else None
+            except self._psycopg.OperationalError:
+                self.conn = None
+                if attempt:
+                    raise
+
+    def read(self, key):
+        row = self._run("SELECT data FROM app_state WHERE id = %s", (key,), fetch=True)
+        return row[0] if row else None
+
+    def write(self, key, state):
+        self._run("INSERT INTO app_state (id, data, updated_at) VALUES (%s, %s, now()) "
+                  "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()", (key, self._Jsonb(state)))
+        if key == "undo":
+            self._undo = True
+
+    def delete(self, key):
+        self._run("DELETE FROM app_state WHERE id = %s", (key,))
+        if key == "undo":
+            self._undo = False
+
+    def exists(self, key):
+        if key == "undo":
+            if self._undo is None:
+                self._undo = self.read("undo") is not None
+            return self._undo
+        return self.read(key) is not None
+
+
+STORE = PgStore(DATABASE_URL) if DATABASE_URL else FileStore()
+
+
 def save():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(S, f, ensure_ascii=False)
-    os.replace(tmp, STATE_FILE)
+    STORE.write("main", S)
 
 
 def load():
-    if os.path.exists(STATE_FILE):
+    st = STORE.read("main")
+    if st is None and DATABASE_URL and os.path.exists(STATE_FILE):  # 数据库为空: 导入旧的 state.json
         with open(STATE_FILE, encoding="utf-8") as f:
             st = json.load(f)
+        STORE.write("main", st)
+        print("已把 data/state.json 导入数据库")
+    if st is not None:
         for k, v in DEFAULT_CONFIG.items():
             st["config"].setdefault(k, v)
         st.setdefault("events", [])
@@ -312,9 +398,7 @@ def settle_week():
     missing = [a["id"] for a in S["assets"] if a["enabled"] and not S["prices"].get(str(w), {}).get(a["id"])]
     if missing:
         raise ApiError(f"第 {w} 周缺少价格: {', '.join(missing[:6])}{'...' if len(missing) > 6 else ''}")
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(UNDO_FILE, "w", encoding="utf-8") as f:
-        json.dump(S, f, ensure_ascii=False)
+    STORE.write("undo", S)
     teams = list(S["teams"].values())
     for t in teams:  # 现金利息
         interest = t["cash"] * c["cash_rate"] / 52
@@ -355,19 +439,18 @@ def settle_week():
 
 def undo_settle():
     global S
-    if not os.path.exists(UNDO_FILE):
+    prev = STORE.read("undo")
+    if prev is None:
         raise ApiError("没有可撤销的结算")
-    with open(UNDO_FILE, encoding="utf-8") as f:
-        S = json.load(f)
-    os.remove(UNDO_FILE)
+    S = prev
+    STORE.delete("undo")
 
 
 def reset_game(full=False):
     keep = S["teams"]
     S["week"], S["finished"], S["loans"] = 1, False, []
     S["teams"] = {}
-    if os.path.exists(UNDO_FILE):
-        os.remove(UNDO_FILE)
+    STORE.delete("undo")
     if not full:
         for t in keep.values():
             nt = new_team(t["name"], t["code"], t["members"])
@@ -465,7 +548,7 @@ def build_state(sess):
                events=[e for e in S["events"] if admin or e["week"] <= S["week"]],
                board=scoreboard() if (admin or any(len(t["hist"]) > 1 for t in S["teams"].values())) else [],
                team_names={t["id"]: t["name"] for t in S["teams"].values()},
-               role=sess["role"], can_undo=os.path.exists(UNDO_FILE))
+               role=sess["role"], can_undo=STORE.exists("undo"))
     if admin:
         out["teams"] = {tid: team_view(t) for tid, t in S["teams"].items()}
         out["loans"] = S["loans"]
@@ -1223,7 +1306,7 @@ if __name__ == "__main__":
     with LOCK:
         save()
     print(f"Market Simulation 已启动\n  本机:   http://localhost:{port}\n  局域网: http://{lan_ip()}:{port}  (学生用这个地址)")
-    print(f"  数据文件: {STATE_FILE}")
+    print(f"  数据存储: {STORE.desc}")
     if not os.environ.get("ADMIN_PASSWORD"):
         print(f"  管理员密码: {S['admin_password']}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
