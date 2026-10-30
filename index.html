@@ -58,7 +58,7 @@ async function api(path,body){
 }
 function toast(m,bad){const t=$("#toast");t.textContent=m;t.style.background=bad?"var(--down)":"";t.style.color=bad?"#fff":"";t.style.display="block";clearTimeout(t._h);t._h=setTimeout(()=>t.style.display="none",3500)}
 async function act(path,body,ok){try{await api(path,body);if(ok)toast(ok);await refresh()}catch(e){toast(e.message,true)}}
-async function refresh(){try{ST=await api("/api/state");render()}catch(e){if(token)toast(e.message,true)}}
+async function refresh(){try{ST=await api("/api/state");ui.skew=ST.server_time*1000-Date.now();render()}catch(e){if(token)toast(e.message,true)}}
 
 function login(admin){
   const b=admin?{admin:1,password:$("#pw").value}:{code:$("#code").value,name:$("#nm").value};
@@ -103,6 +103,10 @@ function boardTable(){
 function events(){return ST.events.length?ST.events.slice().sort((a,b)=>b.week-a.week).map(e=>`<div class="event"><b>第${e.week}周事件</b>：${esc(e.text)}</div>`).join(""):""}
 function lastPrice(id){const ws=Object.keys(ST.prices).map(Number).sort((a,b)=>a-b);for(let i=ws.length-1;i>=0;i--){const p=ST.prices[ws[i]][id];if(p)return p}return 0}
 function prevPrice(id){const ws=Object.keys(ST.prices).map(Number).sort((a,b)=>b-a);let n=0;for(const w of ws){const p=ST.prices[w][id];if(p){if(n++===1)return p}}return null}
+function dlLeft(){return ST.deadline?ST.deadline*1000-(Date.now()+(ui.skew||0)):null}
+function fmtLeft(ms){if(ms<=0)return"已截止";const s=Math.floor(ms/1000),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),x=s%60;return(d?d+"天":"")+(d||h?h+"小时":"")+m+"分"+(d?"":x+"秒")}
+function dlHtml(){const l=dlLeft();if(l===null)return"";const t=new Date(ST.deadline*1000).toLocaleString();return`<span class="tag ${l<=0?'bad':l<3600000?'wn':'ok'}" data-dl=1>截止 ${t} · ${fmtLeft(l)}</span>`}
+setInterval(()=>{document.querySelectorAll("[data-dl]").forEach(e=>{const l=dlLeft();if(l===null)return;const t=new Date(ST.deadline*1000).toLocaleString();e.textContent=`截止 ${t} · ${fmtLeft(l)}`;e.className="tag "+(l<=0?"bad":l<3600000?"wn":"ok");if(l<=0&&!ui.dlDone){ui.dlDone=1;render()}})},1000);
 function weekBadge(){return ST.finished?`<span class="tag bad">已结束</span>`:`<span class="tag ok">第 ${ST.week} / ${ST.config.total_weeks} 周 · 交易进行中</span>`}
 
 /* ---------- team ---------- */
@@ -145,18 +149,19 @@ function tradeView(m){
   const lastSettled=m.orders.filter(o=>o.status!=="pending").slice(-15).reverse();
   const q=(ui.q||"").toLowerCase();
   const list=ST.assets.filter(a=>a.enabled&&(!q||(a.name+a.id+a.sector).toLowerCase().includes(q)));
-  return`${events()}<div class="card"><h2>下单 ${weekBadge()}</h2>
+  return`${events()}<div class="card"><h2>下单 ${weekBadge()} ${dlHtml()}</h2>
   <p class="mute">本周订单将在老师结算时，按<b>第 ${ST.week} 周收盘价</b>成交（目前看到的是第 ${ST.week-1} 周价格）。先执行卖出，再执行买入；手续费 ${pc(c.fee_rate,2)}。
   限制：单只股票 ≤ ${pc(c.max_single,0)}，股票总仓位 ≤ ${pc(c.max_stock_total,0)}，黄金 ≤ ${pc(c.max_gold,0)}，国债 ≤ ${pc(c.max_bond,0)}，现金 ≥ ${pc(c.min_cash,0)}。违规订单会被拒绝。</p>
   <div class="row"><input placeholder="搜索 代码/名称/行业" value="${esc(ui.q||"")}" oninput="ui.q=this.value;render(true)" id="srch"><span class="mute">可用现金 ${fm(m.cash)}</span></div>
   <div class="scroll"><table><tr><th>资产</th><th>行业</th><th>最新价</th><th>周涨跌</th><th>持仓</th><th>数量</th><th></th></tr>
   ${list.map(a=>{const p=lastPrice(a.id),pp=prevPrice(a.id);return`<tr><td>${esc(a.name)} <span class="mute">${esc(a.id)}</span></td><td>${esc(a.sector)}</td><td>${fm(p,2)}</td><td>${pp?sg(p/pp-1):"-"}</td><td>${fm(m.holdings[a.id]||0)}</td>
   <td><input type="number" min="1" step="1" id="q_${a.id.replace(/\W/g,'_')}" placeholder="股数"></td>
-  <td><button class="b s g" ${ST.finished?"disabled":""} onclick="order('${a.id}','buy')">买</button> <button class="b s r" ${ST.finished?"disabled":""} onclick="order('${a.id}','sell')">卖</button></td></tr>`}).join("")}</table></div></div>
+  <td><button class="b s g" ${ST.finished||(dlLeft()!==null&&dlLeft()<=0)?"disabled":""} onclick="order('${a.id}','buy')">买</button> <button class="b s r" ${ST.finished||(dlLeft()!==null&&dlLeft()<=0)?"disabled":""} onclick="order('${a.id}','sell')">卖</button></td></tr>`}).join("")}</table></div></div>
   <div class="card"><h2>本周待执行订单</h2>${pend.length?`<table class="tl"><tr><th>资产</th><th>方向</th><th>数量</th><th>预估金额</th><th></th></tr>${pend.map(o=>`<tr><td>${esc(am[o.asset]?.name||o.asset)}</td><td>${o.side==="buy"?"买入":"卖出"}</td><td>${fm(o.qty)}</td><td>${fm(o.qty*lastPrice(o.asset))}</td><td><button class="b s o" onclick="act('/api/order/cancel',{id:'${o.id}'})">撤销</button></td></tr>`).join("")}</table>`:'<p class="mute">暂无</p>'}</div>
   <div class="card"><h2>最近成交记录</h2>${lastSettled.length?`<div class="scroll"><table class="tl"><tr><th>周</th><th>资产</th><th>方向</th><th>数量</th><th>成交价</th><th>手续费</th><th>状态</th></tr>${lastSettled.map(o=>`<tr><td>${o.week}</td><td>${esc(am[o.asset]?.name||o.asset)}</td><td>${o.side==="buy"?"买入":"卖出"}</td><td>${fm(o.qty)}</td><td>${o.price?fm(o.price,2):"-"}</td><td>${o.fee?fm(o.fee):"-"}</td><td>${o.status==="filled"?'<span class="tag ok">成交</span>':`<span class="tag bad">拒绝</span> ${esc(o.note||"")}`}</td></tr>`).join("")}</table></div>`:'<p class="mute">暂无</p>'}</div>`;
 }
 function order(id,side){
+  if(dlLeft()!==null&&dlLeft()<=0)return toast("已过本周下单截止时间",true);
   const el=document.getElementById("q_"+id.replace(/\W/g,"_")),qty=parseInt(el.value);
   if(!qty||qty<1)return toast("请输入股数",true);
   act("/api/order",{asset:id,side,qty},"订单已提交");
@@ -193,6 +198,7 @@ function adminView(){
     return`<div class="card"><h2>游戏进度 ${weekBadge()}</h2>
     ${ST.finished?'<p>游戏已结束，请查看排行榜。</p>':`<p>当前为第 <b>${ST.week}</b> 周。学生下单后，点击“结算本周”：系统将以<b>第 ${ST.week} 周价格</b>执行订单、结算贷款、公布收益。</p>
     ${miss.length?`<p class="warn">⚠ 第 ${ST.week} 周尚缺 ${miss.length} 个资产价格：${esc(miss.slice(0,8).join(", "))}${miss.length>8?"…":""} → 请到“资产与价格”录入/导入。</p>`:'<p class="up">✓ 本周价格已齐备</p>'}`}
+    ${ST.finished?'':`<div class="row"><label class="f">本周下单截止时间<input type="datetime-local" id="dl_at" value="${ST.deadline?toLocalInput(ST.deadline):''}"></label><button class="b o" onclick="setDeadline()">设置</button><button class="b o" onclick="setDeadline(1)">清除</button><button class="b o" onclick="setDeadline(2)">1 小时后截止</button>${dlHtml()}</div><p class="mute" style="font-size:12px">截止后学生不能下单/撤单。老师仍可结算。每次结算后截止时间会清空，需重新设置。</p>`}
     <div class="row"><button class="b" ${ST.finished||miss.length?"disabled":""} onclick="if(confirm('确认结算第${ST.week}周？'))act('/api/admin/settle',{},'结算完成')">结算本周</button>
     <button class="b o" ${ST.can_undo?"":"disabled"} onclick="if(confirm('撤销最近一次结算？'))act('/api/admin/undo',{},'已撤销')">撤销上次结算</button>
     <button class="b r" onclick="if(confirm('重置游戏：清空所有交易/贷款/历史，保留小组与资产。确认？'))act('/api/admin/reset',{},'已重置')">重置游戏</button></div></div>
@@ -217,6 +223,9 @@ function adminView(){
   if(tab==="acct")return accountingAdmin();
   if(tab==="board")return`<div class="card"><h2>排行榜</h2>${boardTable()}</div>`;
 }
+function toLocalInput(ts){const d=new Date(ts*1000),z=n=>String(n).padStart(2,"0");return`${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`}
+function setDeadline(mode){let at="";if(mode===2)at=Date.now()/1000+3600;else if(!mode){const v=$("#dl_at").value;if(!v)return toast("请选择时间",true);at=new Date(v).getTime()/1000}
+  ui.dlDone=0;act("/api/admin/deadline",{at},at===""?"已清除截止时间":"截止时间已设置")}
 function saveTeam(id){act("/api/admin/team",{id,name:$("#tn_"+id).value,code:$("#tc_"+id).value,members:$("#tm_"+id).value.split(/[,，]/)},"已保存")}
 function assetsAdmin(){
   const w=ui.pw??ST.week,n=ST.config.total_weeks;
@@ -224,7 +233,13 @@ function assetsAdmin(){
   return`<div class="card"><h2>价格管理</h2>
   <p class="mute">学生只能看到已结算周（≤ 第${ST.week-1}周）的价格，所以提前录入未来价格不会泄露。第 0 周为初始价格。国债价格由年化收益自动累计。</p>
   <div class="row"><button class="b o" onclick="document.getElementById('csvf').click()">导入 CSV</button><input type="file" id="csvf" accept=".csv,.txt" style="display:none" onchange="importCsv(this)">
-  <button class="b o" onclick="dlTemplate()">下载 CSV 模板</button>
+  <button class="b o" onclick="dlTemplate()">下载 CSV 模板</button></div>
+  <h3>自动拉取真实收盘价（Yahoo Finance）</h3>
+  <p class="mute" style="font-size:12px">填写<b>第 0 周对应的日期</b>，系统按每 7 天一周取对应日期当天（或之前最近交易日）的收盘价。只会填入<b>已经过去</b>的周；未来的周要等日期到了再拉一次。已结算的周不会被改动。黄金用 COMEX 期货（GC=F）× 美元兑港币汇率。数据源是非官方接口，可能被限流，失败时请改用 CSV 导入。</p>
+  <div class="row"><label class="f">第 0 周日期<input type="date" id="fx_d0" value="${ST.config.price_start_date||''}"></label>
+  <label><input type="checkbox" id="fx_ow"> 覆盖已有价格</label><button class="b" id="fx_btn" onclick="fetchPrices()">拉取价格</button><span class="mute" id="fx_msg"></span></div>
+  <div id="fx_res">${ui.fxres||''}</div>
+  <div class="row">
   <input id="seed" placeholder="随机种子(可空)" style="width:130px"><button class="b o" onclick="if(confirm('用随机游走演示价格覆盖全部价格？'))act('/api/admin/prices',{mode:'generate',seed:$('#seed').value},'已生成演示价格')">生成演示价格</button></div>
   <p class="mute" style="font-size:12px">CSV 格式：第一列 week（0..${n}），其余列为资产代码（如 0700.HK, GOLD），每行一周的价格（收盘价，HKD）。真实价格可从 Yahoo Finance / 财经网站导出后整理。</p>
   <h3>手动编辑某一周价格</h3><div class="row"><label class="f">周次<select onchange="ui.pw=+this.value;render()">${Array.from({length:n+1},(_,i)=>`<option ${i==w?"selected":""} value="${i}">第${i}周${i==ST.week?"（当前待结算）":""}</option>`).join("")}</select></label>
@@ -235,6 +250,13 @@ function assetsAdmin(){
   <h3>新增 / 修改资产</h3><div class="row"><input id="as_id" placeholder="代码 如 0941.HK" style="width:130px"><input id="as_n" placeholder="名称"><select id="as_t"><option value="stock">股票</option><option value="gold">黄金</option><option value="bond">国债</option></select><input id="as_s" placeholder="行业" style="width:90px"><input id="as_b" type="number" placeholder="基准价" step="any">
   <button class="b" onclick="act('/api/admin/asset',{id:$('#as_id').value,name:$('#as_n').value,type:$('#as_t').value,sector:$('#as_s').value,base:+$('#as_b').value},'已保存')">保存</button></div></div>`;
 }
+async function fetchPrices(){const d=$("#fx_d0").value;if(!d)return toast("请先填写第 0 周日期",true);
+  const b=$("#fx_btn");b.disabled=true;$("#fx_msg").textContent="拉取中，约需十几秒…";
+  try{const r=await api("/api/admin/prices/fetch",{start_date:d,overwrite:$("#fx_ow").checked});
+    ui.fxres=`<div class="card" style="margin:8px 0"><b>结果：</b>写入 ${r.filled} 个价格，保留已有 ${r.kept} 个；已结算锁定周：${r.locked_weeks.length?r.locked_weeks.map(x=>"第"+x+"周").join("、"):"无"}。`
+      +(r.pending_weeks.length?`<br>尚未到日期（稍后再拉）：${r.pending_weeks.map(x=>"第"+x.week+"周("+x.date+")").join("、")}`:"")
+      +(r.failed.length?`<div class="warn" style="margin-top:6px">失败 ${r.failed.length} 项：<br>${r.failed.slice(0,12).map(f=>esc(f.id)+"："+esc(f.error)).join("<br>")}${r.failed.length>12?"<br>…":""}</div>`:"")+"</div>";
+    toast(`已写入 ${r.filled} 个价格`);await refresh()}catch(e){toast(e.message,true);ui.fxres="";b.disabled=false;$("#fx_msg").textContent=""}}
 function savePrices(w){const p={};document.querySelectorAll(".pp").forEach(i=>{if(i.value!=="")p[i.dataset.id]=+i.value});act("/api/admin/prices",{mode:"week",week:w,prices:p},"价格已保存")}
 function importCsv(inp){const f=inp.files[0];if(!f)return;const r=new FileReader();r.onload=async()=>{try{const j=await api("/api/admin/prices",{mode:"csv",text:r.result});toast(`导入 ${j.count} 个价格`);refresh()}catch(e){toast(e.message,true)}};r.readAsText(f);inp.value=""}
 function dlTemplate(){

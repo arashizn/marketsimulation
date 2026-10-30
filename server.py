@@ -4,6 +4,7 @@
 运行:  python server.py [端口]      默认 8000, 管理员密码默认 admin
 """
 import csv
+import datetime
 import copy
 import io
 import json
@@ -16,7 +17,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(ROOT, "data")
@@ -37,6 +38,7 @@ DEFAULT_CONFIG = dict(
     self_join=True,
     w_ret=30, w_risk=15, w_liq=10, w_credit=10, w_report=10, w_accounting=25,
     accounting_enabled=True, accounting_lock_trade=False,
+    price_start_date="",
 )
 
 # id, 名称, 类型, 行业, 模拟基准价(HKD, 仅用于生成演示价格, 可在后台改)
@@ -76,7 +78,7 @@ def new_state():
     S = dict(
         config=copy.deepcopy(DEFAULT_CONFIG), admin_password="admin",
         assets=[dict(id=i, name=n, type=t, sector=s, base=b, enabled=True) for i, n, t, s, b in DEFAULT_ASSETS],
-        prices={}, teams={}, loans=[], week=1, finished=False, seq=0,
+        prices={}, teams={}, loans=[], week=1, finished=False, seq=0, deadline=None,
         events=[],  # 老师每周发布的事件卡 {week, text}
     )
     generate_prices(S, seed=42)
@@ -184,6 +186,7 @@ def load():
         for k, v in DEFAULT_CONFIG.items():
             st["config"].setdefault(k, v)
         st.setdefault("events", [])
+        st.setdefault("deadline", None)
         for t in st["teams"].values():
             t.setdefault("acct_classes", {})
             t.setdefault("accounting", {})
@@ -435,6 +438,7 @@ def settle_week():
         S["finished"] = True
     else:
         S["week"] = w + 1
+    S["deadline"] = None  # 新的一周需要老师重新设置截止时间
 
 
 def undo_settle():
@@ -449,6 +453,7 @@ def undo_settle():
 def reset_game(full=False):
     keep = S["teams"]
     S["week"], S["finished"], S["loans"] = 1, False, []
+    S["deadline"] = None
     S["teams"] = {}
     STORE.delete("undo")
     if not full:
@@ -548,7 +553,7 @@ def build_state(sess):
                events=[e for e in S["events"] if admin or e["week"] <= S["week"]],
                board=scoreboard() if (admin or any(len(t["hist"]) > 1 for t in S["teams"].values())) else [],
                team_names={t["id"]: t["name"] for t in S["teams"].values()},
-               role=sess["role"], can_undo=STORE.exists("undo"))
+               role=sess["role"], can_undo=STORE.exists("undo"), deadline=S.get("deadline"), server_time=time.time())
     if admin:
         out["teams"] = {tid: team_view(t) for tid, t in S["teams"].items()}
         out["loans"] = S["loans"]
@@ -624,6 +629,8 @@ def api_order(sess, b):
     t = need_team(sess)
     if S["finished"]:
         raise ApiError("游戏已结束")
+    if deadline_passed():
+        raise ApiError("已过本周下单截止时间")
     c = S["config"]
     if c["accounting_enabled"] and c["accounting_lock_trade"] and S["week"] - 1 >= first_acct_week(t)             and not t["accounting"].get(str(S["week"] - 1), {}).get("closing"):
         raise ApiError("请先提交上一周的会计结账")
@@ -647,6 +654,8 @@ def api_order(sess, b):
 
 def api_order_cancel(sess, b):
     t = need_team(sess)
+    if deadline_passed():
+        raise ApiError("已过本周下单截止时间, 不能撤单")
     for o in t["orders"]:
         if o["id"] == b.get("id") and o["status"] == "pending" and o["week"] == S["week"]:
             t["orders"].remove(o)
@@ -792,9 +801,145 @@ def a_asset_save(sess, b):
         a = dict(id=aid)
         S["assets"].append(a)
     a.update(name=str(b.get("name") or aid), type=b["type"], sector=str(b.get("sector") or ""),
-             base=base, enabled=bool(b.get("enabled", True)))
+             base=base, enabled=bool(b.get("enabled", True)), symbol=str(b.get("symbol") or "").strip()[:30],
+             ccy="USD" if b.get("ccy") == "USD" else "HKD")
     ensure_bond(S)
     return {}
+
+
+# ----------------------------------------------------------------- 下单截止时间
+def deadline_passed():
+    d = S.get("deadline")
+    return bool(d) and time.time() >= d
+
+
+@admin_only
+def a_deadline(sess, b):
+    at = b.get("at")
+    S["deadline"] = None if at in (None, "") else num(b, "at", 1)
+    return {}
+
+
+# ----------------------------------------------------------------- 自动拉取收盘价 (Yahoo Finance 非官方接口)
+YF_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&period1={p1}&period2={p2}"
+YF_DEFAULT = {"GOLD": ("GC=F", "USD")}  # 黄金默认用 COMEX 黄金期货(美元/盎司), 再按汇率折成港币
+FX_SYMBOL = "HKD=X"  # 1 美元 = ? 港币
+
+
+def http_get_json(url):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (MarketSimulation)", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        raw = r.read()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise ApiError("数据源返回了非数据页面(可能被限流或拦截), 请稍后重试或改用 CSV 导入")
+
+
+def fetch_series(sym, d0, d1):
+    """返回 [(交易所本地日期, 收盘价)] 升序."""
+    utc = datetime.timezone.utc
+    p1 = int(datetime.datetime.combine(d0 - datetime.timedelta(days=10), datetime.time(), utc).timestamp())
+    p2 = int(datetime.datetime.combine(d1 + datetime.timedelta(days=2), datetime.time(), utc).timestamp())
+    try:
+        j = http_get_json(YF_URL.format(sym=quote(sym, safe=""), p1=p1, p2=p2))
+    except ApiError:
+        raise
+    except Exception as e:
+        raise ApiError(f"网络/数据源错误: {e}")
+    try:
+        res = j["chart"]["result"][0]
+    except (KeyError, IndexError, TypeError):
+        err = ((j or {}).get("chart") or {}).get("error") or {}
+        raise ApiError(err.get("description") or "没有返回数据(代码可能不对)")
+    off = (res.get("meta") or {}).get("gmtoffset") or 0
+    ts = res.get("timestamp") or []
+    cl = (((res.get("indicators") or {}).get("quote") or [{}])[0].get("close")) or []
+    out = [(datetime.datetime.fromtimestamp(t + off, utc).date(), float(c)) for t, c in zip(ts, cl) if c and c > 0]
+    out.sort()
+    if not out:
+        raise ApiError("该时间段没有价格数据")
+    return out
+
+
+def pick_close(series, d, maxgap=6):
+    """取 d 当天或之前最近一个交易日的收盘价(周末/假期顺延到前一交易日)."""
+    best = None
+    for dd, c in series:
+        if dd > d:
+            break
+        best = (dd, c)
+    return best[1] if best and (d - best[0]).days <= maxgap else None
+
+
+def fetch_plan(b):
+    c = S["config"]
+    try:
+        d0 = datetime.date.fromisoformat(str(b.get("start_date", "")).strip())
+    except ValueError:
+        raise ApiError("请填写第 0 周对应的日期, 格式 YYYY-MM-DD")
+    c["price_start_date"] = d0.isoformat()
+    jobs = []
+    for a in S["assets"]:
+        if a["enabled"] and a["type"] != "bond":
+            dsym, dccy = YF_DEFAULT.get(a["id"], (a["id"], "HKD"))
+            jobs.append((a["id"], a.get("symbol") or dsym, a.get("ccy") or dccy))
+    return dict(d0=d0, n=c["total_weeks"], jobs=jobs, overwrite=bool(b.get("overwrite")), cur=S["week"])
+
+
+def fetch_run(plan):
+    """联网部分, 不持有全局锁."""
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    d1 = min(plan["d0"] + datetime.timedelta(days=7 * plan["n"]), today)
+    data = dict(series={}, errors={}, fx=None, fx_error=None, today=today)
+    if d1 < plan["d0"]:
+        return data
+    for aid, sym, ccy in plan["jobs"]:
+        try:
+            data["series"][aid] = fetch_series(sym, plan["d0"], d1)
+        except ApiError as e:
+            data["errors"][aid] = str(e)
+    if any(ccy == "USD" for _, _, ccy in plan["jobs"]):
+        try:
+            data["fx"] = fetch_series(FX_SYMBOL, plan["d0"], d1)
+        except ApiError as e:
+            data["fx_error"] = str(e)
+    return data
+
+
+def fetch_apply(plan, data):
+    d0, n, cur = plan["d0"], plan["n"], plan["cur"]
+    wd = {w: d0 + datetime.timedelta(days=7 * w) for w in range(n + 1)}
+    locked = [w for w in range(n + 1) if w < cur]  # 已结算的周: 价格不能再改
+    ended = [w for w in range(n + 1) if wd[w] < data["today"] and w not in locked]
+    pending = [w for w in range(n + 1) if wd[w] >= data["today"] and w not in locked]
+    filled = kept = 0
+    failed = [dict(id=aid, error=e) for aid, e in data["errors"].items()]
+    for aid, sym, ccy in plan["jobs"]:
+        ser = data["series"].get(aid)
+        if ser is None:
+            continue
+        if ccy == "USD" and data["fx"] is None:
+            failed.append(dict(id=aid, error=f"需要汇率 {FX_SYMBOL}: {data['fx_error'] or '无数据'}"))
+            continue
+        for w in ended:
+            px = pick_close(ser, wd[w])
+            if px is not None and ccy == "USD":
+                fx = pick_close(data["fx"], wd[w])
+                px = px * fx if fx else None
+            if px is None:
+                failed.append(dict(id=aid, error=f"第{w}周({wd[w]}) 附近没有收盘价"))
+                continue
+            row = S["prices"].setdefault(str(w), {})
+            if aid in row and not plan["overwrite"]:
+                kept += 1
+            else:
+                row[aid] = round(px, 4)
+                filled += 1
+    ensure_bond(S)
+    return dict(filled=filled, kept=kept, failed=failed, locked_weeks=locked,
+                pending_weeks=[dict(week=w, date=wd[w].isoformat()) for w in pending])
 
 
 @admin_only
@@ -1217,7 +1362,7 @@ POST = {
     "/api/admin/config": a_config, "/api/admin/team": a_team_save, "/api/admin/teams/batch": a_team_batch,
     "/api/admin/team/delete": a_team_delete, "/api/admin/asset": a_asset_save, "/api/admin/prices": a_prices,
     "/api/admin/settle": a_settle, "/api/admin/undo": a_undo, "/api/admin/reset": a_reset,
-    "/api/admin/grade": a_grade, "/api/admin/event": a_event,
+    "/api/admin/deadline": a_deadline, "/api/admin/grade": a_grade, "/api/admin/event": a_event,
     "/api/accounting/preview": api_acct_preview, "/api/accounting/submit": api_acct_submit,
     "/api/accounting/get": api_acct_get, "/api/admin/accounting/grade": a_acct_grade,
 }
@@ -1266,7 +1411,13 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             with LOCK:
-                if path == "/api/login":
+                if path == "/api/admin/prices/fetch":
+                    sess = self.session()
+                    if not sess or sess["role"] != "admin":
+                        return self.send(401, dict(error="需要管理员权限"))
+                    plan = fetch_plan(body)
+                    res = None
+                elif path == "/api/login":
                     res = api_login(None, body, self.client_ip())
                 else:
                     sess = self.session()
@@ -1277,6 +1428,11 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send(404, dict(error="not found"))
                     res = fn(sess, body)
                 save()
+            if res is None:  # 拉取价格: 联网时不持有全局锁, 避免卡住其他用户
+                data = fetch_run(plan)
+                with LOCK:
+                    res = fetch_apply(plan, data)
+                    save()
             self.send(200, res)
         except ApiError as e:
             self.send(400, dict(error=str(e)))
