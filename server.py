@@ -39,6 +39,7 @@ DEFAULT_CONFIG = dict(
     w_ret=30, w_risk=15, w_liq=10, w_credit=10, w_report=10, w_accounting=25,
     accounting_enabled=True, accounting_lock_trade=False,
     price_start_date="",
+    market_enabled=True, market_rate_min=0.0, market_rate_max=0.30,
 )
 
 # id, 名称, 类型, 行业, 模拟基准价(HKD, 仅用于生成演示价格, 可在后台改)
@@ -78,7 +79,7 @@ def new_state():
     S = dict(
         config=copy.deepcopy(DEFAULT_CONFIG), admin_password="admin",
         assets=[dict(id=i, name=n, type=t, sector=s, base=b, enabled=True) for i, n, t, s, b in DEFAULT_ASSETS],
-        prices={}, teams={}, loans=[], week=1, finished=False, seq=0, deadline=None,
+        prices={}, teams={}, loans=[], week=1, finished=False, seq=0, deadline=None, shocks=[], offers=[],
         events=[],  # 老师每周发布的事件卡 {week, text}
     )
     generate_prices(S, seed=42)
@@ -187,6 +188,8 @@ def load():
             st["config"].setdefault(k, v)
         st.setdefault("events", [])
         st.setdefault("deadline", None)
+        st.setdefault("shocks", [])
+        st.setdefault("offers", [])
         for t in st["teams"].values():
             t.setdefault("acct_classes", {})
             t.setdefault("accounting", {})
@@ -235,7 +238,7 @@ def generate_prices(st, seed=None):
     ensure_bond(st)
 
 
-def price_at(st, aid, w):
+def raw_price_at(st, aid, w):
     for k in range(w, -1, -1):
         p = st["prices"].get(str(k), {}).get(aid)
         if p:
@@ -244,6 +247,22 @@ def price_at(st, aid, w):
         if a["id"] == aid:
             return a["base"]
     return 0.0
+
+
+def shock_factor(st, a, w):
+    """事件冲击: 该周及以后各周, 价格按百分比持续偏移 (多个冲击连乘). a=资产 dict."""
+    f = 1.0
+    for sh in st.get("shocks", []):
+        if sh["week"] <= w and (sh["target"] == a["id"] or sh["target"] == "type:" + a["type"]
+                                or sh["target"] == "sector:" + (a.get("sector") or "")):
+            f *= 1 + sh["pct"] / 100
+    return f
+
+
+def price_at(st, aid, w):
+    p = raw_price_at(st, aid, w)
+    a = next((x for x in st["assets"] if x["id"] == aid), None)
+    return p * shock_factor(st, a, w) if a and st.get("shocks") else p
 
 
 def import_csv(st, text):
@@ -411,6 +430,9 @@ def settle_week():
         for o in t["orders"]:
             if o["week"] == w and o["status"] == "pending" and o["side"] == "sell":
                 exec_sell(t, o, w)
+    for o in S["offers"]:
+        if o["status"] == "open":
+            o["status"] = "expired"
     for l in S["loans"]:  # 还款
         if l["status"] == "pending":
             l["status"] = "expired"
@@ -452,7 +474,7 @@ def undo_settle():
 
 def reset_game(full=False):
     keep = S["teams"]
-    S["week"], S["finished"], S["loans"] = 1, False, []
+    S["week"], S["finished"], S["loans"], S["offers"] = 1, False, [], []
     S["deadline"] = None
     S["teams"] = {}
     STORE.delete("undo")
@@ -547,16 +569,26 @@ def build_state(sess):
     c = S["config"]
     admin = sess["role"] == "admin"
     upto = c["total_weeks"] if (admin or S["finished"]) else S["week"] - 1
-    prices = {k: v for k, v in S["prices"].items() if int(k) <= upto}
+    prices = {}
+    for k in S["prices"]:
+        if int(k) <= upto:
+            if admin:  # 老师看到/编辑的是原始价格(冲击单独在"事件冲击"页管理), 否则保存时会把冲击重复叠加
+                prices[k] = S["prices"][k]
+            else:
+                prices[k] = {a["id"]: round(price_at(S, a["id"], int(k)), 4) for a in S["assets"]
+                             if S["prices"][k].get(a["id"])}
     cfg = dict(c)
     out = dict(config=cfg, assets=S["assets"], prices=prices, week=S["week"], finished=S["finished"],
                events=[e for e in S["events"] if admin or e["week"] <= S["week"]],
                board=scoreboard() if (admin or any(len(t["hist"]) > 1 for t in S["teams"].values())) else [],
                team_names={t["id"]: t["name"] for t in S["teams"].values()},
-               role=sess["role"], can_undo=STORE.exists("undo"), deadline=S.get("deadline"), server_time=time.time())
+               role=sess["role"], can_undo=STORE.exists("undo"), deadline=S.get("deadline"), server_time=time.time(),
+               offers=[o for o in S["offers"] if o["status"] == "open"],
+               shocks=[sh for sh in S["shocks"] if admin or sh["week"] <= S["week"] - 1])
     if admin:
         out["teams"] = {tid: team_view(t) for tid, t in S["teams"].items()}
         out["loans"] = S["loans"]
+        out["dash"] = dashboard()
         out["missing_price"] = [a["id"] for a in S["assets"] if a["enabled"] and
                                 a["type"] != "bond" and not S["prices"].get(str(S["week"]), {}).get(a["id"])]
     else:
@@ -564,6 +596,7 @@ def build_state(sess):
         if not t:
             raise ApiError("小组已被删除, 请重新登录")
         out["me"] = team_view(t)
+        out["me"]["risk"] = team_risk(t)
         out["user"] = sess["name"]
     return out
 
@@ -787,6 +820,7 @@ def a_team_delete(sess, b):
         raise ApiError("该小组存在未结清贷款, 不能删除")
     S["teams"].pop(tid, None)
     S["loans"] = [l for l in S["loans"] if tid not in (l["lender"], l["borrower"])]
+    S["offers"] = [o for o in S["offers"] if o["team"] != tid]
     return {}
 
 
@@ -1000,6 +1034,195 @@ def a_event(sess, b):
     return {}
 
 
+# ----------------------------------------------------------------- 老师看板
+def dashboard():
+    """每组一行: 下单/会计/报告/借贷状态与现金比例预警. 现金比例用最近一次结算的数据."""
+    c = S["config"]
+    w = S["week"]
+    rows = []
+    for t in S["teams"].values():
+        h = t["hist"][-1] if t["hist"] else None
+        nav = h["nav"] if h else 0
+        cash_ratio = (h["cash"] / nav) if h and nav > 0 else None
+        cur_w = c["total_weeks"] if S["finished"] else max(w - 1, 0)
+        rec = t["accounting"].get(str(cur_w))
+        rows.append(dict(
+            id=t["id"], name=t["name"], members=len(t["members"]),
+            orders=sum(1 for o in t["orders"] if o["week"] == w and o["status"] == "pending"),
+            report=bool(t["reports"].get(str(w), {}).get("text")),
+            acct=("none" if cur_w < first_acct_week(t) else "graded" if rec and rec.get("grade") is not None
+                  else "submitted" if rec and rec.get("closing") else "returned" if rec and rec.get("status") == "returned" else "missing"),
+            pending_loans=sum(1 for l in S["loans"] if l["status"] == "pending" and t["id"] in (l["lender"], l["borrower"])),
+            cash_ratio=cash_ratio, cash_warn=cash_ratio is not None and cash_ratio < c["min_cash"] + 0.02,
+            cash_bad=cash_ratio is not None and cash_ratio < c["min_cash"],
+            due_loans=sum(1 for l in S["loans"] if l["status"] == "active" and l["borrower"] == t["id"] and l["due"] == w),
+        ))
+    return rows
+
+
+# ----------------------------------------------------------------- 风险指标
+def team_risk(t):
+    """夏普比率(周频年化)、各资产对收益的贡献、行业集中度(取自最近一次结算后的持仓)."""
+    c = S["config"]
+    h = t["hist"]
+    navs = [x["nav"] for x in h]
+    rets = [navs[i] / navs[i - 1] - 1 for i in range(1, len(navs)) if navs[i - 1] > 0]
+    sharpe = None
+    if len(rets) >= 2:
+        m = sum(rets) / len(rets)
+        sd = math.sqrt(sum((r - m) ** 2 for r in rets) / (len(rets) - 1))
+        rf = c["cash_rate"] / 52
+        if sd > 1e-9:
+            sharpe = (m - rf) / sd * math.sqrt(52)
+    w = (h[-1]["week"] if h else 0)
+    am = amap()
+    holds, sectors, tot = [], {}, 0.0
+    for aid, q in t["holdings"].items():
+        if q > 0 and aid in am:
+            v = q * price_at(S, aid, w)
+            cost = t["cost"].get(aid, price_at(S, aid, w))
+            holds.append(dict(id=aid, name=am[aid]["name"], sector=am[aid].get("sector") or "其他", value=v, pnl=q * (price_at(S, aid, w) - cost)))
+            sectors[am[aid].get("sector") or "其他"] = sectors.get(am[aid].get("sector") or "其他", 0.0) + v
+            tot += v
+    nav = navs[-1] if navs else 0
+    hhi = sum((v / tot) ** 2 for v in sectors.values()) if tot > 0 else None
+    return dict(sharpe=sharpe, weeks=len(rets), holdings=sorted(holds, key=lambda x: -abs(x["pnl"])),
+                sectors=sorted(([k, v] for k, v in sectors.items()), key=lambda x: -x[1]), hhi=hhi, invested=tot,
+                nav=nav, top1=(max((x["value"] for x in holds), default=0) / nav if nav > 0 else None))
+
+
+# ----------------------------------------------------------------- 事件冲击
+SHOCK_KIND = ("asset", "type", "sector")
+
+
+@admin_only
+def a_shock(sess, b):
+    kind, val = b.get("kind"), str(b.get("value", "")).strip()
+    if kind not in SHOCK_KIND or not val:
+        raise ApiError("请选择冲击对象")
+    am = amap()
+    if kind == "asset" and val not in am:
+        raise ApiError("资产不存在")
+    if kind == "type" and val not in ("stock", "gold", "bond"):
+        raise ApiError("资产类型无效")
+    if kind == "sector" and val not in {a.get("sector") for a in S["assets"]}:
+        raise ApiError("行业不存在")
+    pct = num(b, "pct", -90, 500)
+    w = int(num(b, "week", 1, S["config"]["total_weeks"]))
+    if w < S["week"] and not S["finished"]:
+        raise ApiError(f"第 {w} 周已结算, 冲击只能设在当前周({S['week']})或之后")
+    target = val if kind == "asset" else f"{kind}:{val}"
+    S["shocks"].append(dict(id=nid("K"), week=w, target=target, pct=pct, note=str(b.get("note", ""))[:200]))
+    return {}
+
+
+@admin_only
+def a_shock_delete(sess, b):
+    sh = next((x for x in S["shocks"] if x["id"] == b.get("id")), None)
+    if not sh:
+        raise ApiError("冲击不存在")
+    if sh["week"] < S["week"]:
+        raise ApiError("该冲击所在周已结算, 不能删除")
+    S["shocks"].remove(sh)
+    return {}
+
+
+# ----------------------------------------------------------------- 同业拆借市场(报价)
+def api_offer_create(sess, b):
+    t = need_team(sess)
+    c = S["config"]
+    if not c["market_enabled"]:
+        raise ApiError("拆借市场未开启")
+    if S["finished"]:
+        raise ApiError("游戏已结束")
+    side = b.get("side")
+    if side not in ("lend", "borrow"):
+        raise ApiError("类型错误")
+    weeks = int(num(b, "weeks"))
+    if weeks not in c["durations"]:
+        raise ApiError(f"期限必须是 {c['durations']} 周之一")
+    if S["week"] + weeks > c["total_weeks"]:
+        raise ApiError("贷款将在游戏结束后到期, 请缩短期限")
+    rate = num(b, "rate", c["rate_min"], c["rate_max"])
+    amount = num(b, "amount", 1)
+    if sum(1 for o in S["offers"] if o["status"] == "open" and o["team"] == t["id"]) >= 10:
+        raise ApiError("同时挂出的报价最多 10 条")
+    S["offers"].append(dict(id=nid("F"), team=t["id"], side=side, amount=round(amount, 2), rate=rate, weeks=weeks,
+                            status="open", week=S["week"]))
+    return {}
+
+
+def api_offer_cancel(sess, b):
+    t = need_team(sess)
+    o = next((x for x in S["offers"] if x["id"] == b.get("id") and x["status"] == "open"), None)
+    if not o or o["team"] != t["id"]:
+        raise ApiError("报价不存在")
+    o["status"] = "cancelled"
+    return {}
+
+
+def api_offer_take(sess, b):
+    """对手方接受报价: 立即生成并激活贷款 (复用 loan_check 的全部限额校验)."""
+    t = need_team(sess)
+    if S["finished"]:
+        raise ApiError("游戏已结束")
+    o = next((x for x in S["offers"] if x["id"] == b.get("id") and x["status"] == "open"), None)
+    if not o:
+        raise ApiError("报价不存在或已被接走")
+    if o["team"] == t["id"]:
+        raise ApiError("不能接自己的报价")
+    if o["team"] not in S["teams"]:
+        raise ApiError("报价方已被删除")
+    amount = round(num(b, "amount", 1, o["amount"]), 2) if b.get("amount") else o["amount"]
+    lender, borrower = (o["team"], t["id"]) if o["side"] == "lend" else (t["id"], o["team"])
+    l = dict(id=nid("L"), lender=lender, borrower=borrower, principal=amount, rate=o["rate"], weeks=o["weeks"],
+             proposer=o["team"], status="pending", start=None, due=None, week=S["week"], via="market")
+    err = loan_check(l)
+    if err:
+        raise ApiError(err)
+    k, bo = S["teams"][lender], S["teams"][borrower]
+    k["cash"] -= amount
+    bo["cash"] += amount
+    l["status"], l["start"], l["due"] = "active", S["week"], S["week"] + l["weeks"]
+    S["loans"].append(l)
+    o["amount"] = round(o["amount"] - amount, 2)
+    if o["amount"] < 1:
+        o["status"] = "filled"
+    return {}
+
+
+# ----------------------------------------------------------------- 现金流量表
+CF_MAP = {  # 非现金科目 -> (类别, 项目). 每个分录里所有非现金行对现金的影响之和 = 该分录的现金变动
+    "利息收入": ("经营活动", "收到/支付利息"), "应收利息": ("经营活动", "收到/支付利息"),
+    "利息费用": ("经营活动", "收到/支付利息"), "应付利息": ("经营活动", "收到/支付利息"),
+    "交易费用": ("经营活动", "支付交易费用与清算罚金"), "强制清算损失": ("经营活动", "支付交易费用与清算罚金"),
+    "贷款及应收款项": ("投资活动", "发放/收回贷款"), "贷款损失准备": ("投资活动", "发放/收回贷款"),
+    "信用减值损失": ("投资活动", "发放/收回贷款"),
+    "短期借款": ("筹资活动", "借入/偿还借款"), "债务核销利得": ("筹资活动", "借入/偿还借款"),
+}
+
+
+def build_cashflow(journals, cash_open):
+    """直接法. 对每个含「现金」行的分录, 其余各行对现金的影响 = -(借方为正的金额), 按科目归类, 合计恰好等于现金变动."""
+    sec = {"经营活动": {}, "投资活动": {}, "筹资活动": {}}
+    total = 0.0
+    for j in journals:
+        if not any(l["account"] == "现金" for l in j["lines"]):
+            continue  # 权责发生制的计提、公允价值变动等不涉及现金
+        total += sum((l["amount"] if l["drcr"] == "Dr" else -l["amount"]) for l in j["lines"] if l["account"] == "现金")
+        for l in j["lines"]:
+            if l["account"] == "现金":
+                continue
+            eff = -(l["amount"] if l["drcr"] == "Dr" else -l["amount"])
+            cat, name = CF_MAP.get(l["account"], ("投资活动", "买卖金融资产"))
+            sec[cat][name] = sec[cat].get(name, 0.0) + eff
+    out = {k: [[n, round(v, 2)] for n, v in d.items() if abs(v) >= 0.005] for k, d in sec.items()}
+    nets = {k: round(sum(v for _, v in rows), 2) for k, rows in out.items()}
+    net = round(sum(nets.values()), 2)
+    return dict(sections=out, nets=nets, net=net, open=round(cash_open, 2), close=round(cash_open + net, 2),
+                check=round(total - net, 2))
+
+
 # ----------------------------------------------------------------- 会计结账
 CLASS_ACC = dict(FVTPL="交易性金融资产", FVOCI="FVOCI金融资产", AC="摊余成本金融资产", INVENTORY="存货-黄金")
 ALLOW_ACC = dict(AC="金融资产减值准备", INVENTORY="存货跌价准备")
@@ -1045,6 +1268,7 @@ def generate_accounting(t, week, decisions):
         init = t["hist"][0]["nav"]
         led, pos, lallow = {"现金": init, "实收资本": -init}, {}, {}
     oci_open = -led.get("其他综合收益", 0.0)
+    cash_open = led.get("现金", 0.0)
     open_qty = {k: p["qty"] for k, p in pos.items()}
     pl, oci, journals, warnings = {}, {}, [], []
     fa = t["facts"].get(str(w), {})
@@ -1289,6 +1513,7 @@ def generate_accounting(t, week, decisions):
         oci_statement=dict(items=oci_items, total=round(sum(x[1] for x in oci_items), 2), opening=round(oci_open, 2),
                            closing=round(-g("其他综合收益"), 2) + 0.0),
         recon=dict(system_nav=hw["nav"], book_equity=round(te, 2), diff=round(hw["nav"] - te, 2)))
+    statements["cashflow"] = build_cashflow(journals, cash_open)
     closing = dict(ledger={k: round(v, 4) for k, v in led.items()}, positions=pos, loan_allow=lallow)
     return dict(journals=journals, statements=statements, warnings=warnings,
                 ctx=dict(week=w, assets=ctx_assets, loans=ctx_loans, classes=CLASS_NAMES), closing=closing)
@@ -1362,7 +1587,8 @@ POST = {
     "/api/admin/config": a_config, "/api/admin/team": a_team_save, "/api/admin/teams/batch": a_team_batch,
     "/api/admin/team/delete": a_team_delete, "/api/admin/asset": a_asset_save, "/api/admin/prices": a_prices,
     "/api/admin/settle": a_settle, "/api/admin/undo": a_undo, "/api/admin/reset": a_reset,
-    "/api/admin/deadline": a_deadline, "/api/admin/grade": a_grade, "/api/admin/event": a_event,
+    "/api/admin/deadline": a_deadline, "/api/admin/shock": a_shock, "/api/admin/shock/delete": a_shock_delete,
+    "/api/offer/create": api_offer_create, "/api/offer/take": api_offer_take, "/api/offer/cancel": api_offer_cancel, "/api/admin/grade": a_grade, "/api/admin/event": a_event,
     "/api/accounting/preview": api_acct_preview, "/api/accounting/submit": api_acct_submit,
     "/api/accounting/get": api_acct_get, "/api/admin/accounting/grade": a_acct_grade,
 }
